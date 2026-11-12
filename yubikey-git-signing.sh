@@ -12,7 +12,7 @@
 # Deliberately NOT using `set -e`: a grep with no match must not kill the UI.
 set -uo pipefail
 
-VERSION="1.6.0"
+VERSION="1.13.1"
 
 # ----------------------------------------------------------------------------
 # Paths. Keys live in ~/.config/git/keys, never in ~/.ssh -- see check_gcr().
@@ -99,6 +99,14 @@ setup_theme() {
     fi
 }
 
+term_height() {
+    local h
+    h=$(tput lines 2>/dev/null) || h=0
+    [[ -z ${h} || ${h} == *[!0-9]* ]] && h=24
+    (( h < 10 )) && h=10
+    printf '%s' "${h}"
+}
+
 term_width() {
     local w
     w=$(tput cols 2>/dev/null) || w=80
@@ -174,7 +182,7 @@ die() { bad "$1"; exit 1; }
 # Terminal state
 # ----------------------------------------------------------------------------
 IN_ALT=0
-enter_alt() { (( PLAIN )) && return 0; printf '%s%s' "${ALT_ON}" "${HIDE_CUR}"; IN_ALT=1; }
+enter_alt() { (( PLAIN )) && return 0; printf '%s%s' "${ALT_ON}" "${HIDE_CUR}"; IN_ALT=1; TTY_TOUCHED=1; }
 leave_alt() {
     (( PLAIN )) && return 0
     printf '%s' "${SHOW_CUR}"
@@ -183,16 +191,29 @@ leave_alt() {
     return 0
 }
 
+# Set the moment we put the terminal into a state the user did not ask for.
+TTY_TOUCHED=0
+
 restore_term() {
-    (( IN_ALT )) && printf '%s' "${ALT_OFF}"
+    if (( IN_ALT )); then printf '%s' "${ALT_OFF}"; IN_ALT=0; fi
     printf '%s' "${SHOW_CUR:-}"
-    stty sane 2>/dev/null
+    # Only reset the line discipline if we changed it. 'stty sane' on every
+    # exit wipes the user's own settings (-ixon, a custom erase) and, worse,
+    # knocks a pager reading the same tty out of raw mode on `--check | less`.
+    if (( TTY_TOUCHED )); then
+        stty sane 2>/dev/null
+        TTY_TOUCHED=0
+    fi
 }
 # A backup taken by backup_existing_key lives between the mv and the keygen
 # result. If we die in that window -- Ctrl-C at the PIN or touch prompt, or the
 # terminal closing -- the restore in step_create_key never runs and the user is
 # left with no key while git still points at one. Put it back on the way out.
 abort_cleanup() {
+    # Only rescue when the key is actually missing. After a successful keygen
+    # the markers may still be set, and restoring then would put the OLD key
+    # back over the new one on a perfectly normal exit.
+    [[ -f ${KEY_PRIV:-} ]] && return 0
     if [[ -n ${BACKUP_PRIV:-} || -n ${BACKUP_PUB:-} ]]; then
         restore_backup >/dev/null 2>&1
         printf '\n  previous signing key put back\n'
@@ -206,7 +227,7 @@ trap 'abort_cleanup; restore_term; printf "\n"; exit 130' INT TERM
 run_interactive() {
     local rc
     leave_alt
-    stty sane 2>/dev/null
+    TTY_TOUCHED=1; stty sane 2>/dev/null
     printf '\n  %s%s %s%s\n\n' "${MUTED}" "${G_ARROW}" "$*" "${RESET}"
     "$@"
     rc=$?
@@ -218,7 +239,7 @@ run_interactive() {
 confirm() {
     local prompt=$1 default=${2:-n} ans
     leave_alt
-    stty sane 2>/dev/null
+    TTY_TOUCHED=1; stty sane 2>/dev/null
     if [[ ${default} == y ]]; then
         printf '  %s%s%s [Y/n] ' "${BOLD}" "${prompt}" "${RESET}"
     else
@@ -233,7 +254,7 @@ confirm() {
 confirm_typed() {
     local word=$1 prompt=$2 ans
     leave_alt
-    stty sane 2>/dev/null
+    TTY_TOUCHED=1; stty sane 2>/dev/null
     printf '  %s%s%s\n' "${WARNC}" "${prompt}" "${RESET}"
     printf '  type %s%s%s to proceed: ' "${BOLD}" "${word}" "${RESET}"
     read -r ans || ans=""
@@ -244,7 +265,7 @@ ask() {
     local prompt=$1 default=${2:-} ans
     # The prompt goes to stderr: callers capture this function's stdout.
     leave_alt >&2
-    stty sane 2>/dev/null
+    TTY_TOUCHED=1; stty sane 2>/dev/null
     if [[ -n ${default} ]]; then
         printf '  %s%s%s [%s]: ' "${BOLD}" "${prompt}" "${RESET}" "${default}" >&2
     else
@@ -264,7 +285,7 @@ MENU_INDEX=0
 ui_menu() {
     local title=$1; shift
     local -a opts=("$@") sel=()
-    local n=${#opts[@]} cur=0 key rest more i w m d
+    local n=${#opts[@]} cur=0 key rest more guard i w m d
 
     for (( i = 0; i < n; i++ )); do
         [[ ${opts[i]} == --* ]] || sel+=("${i}")
@@ -285,18 +306,28 @@ ui_menu() {
                 printf '   %2d) %s\n' "${d}" "${opts[i]}"
             fi
         done
-        printf 'select [1-%d, q]: ' "${m}"
-        read -r key || key=q
-        [[ ${key} == [Qq]* || -z ${key} ]] && return 1
-        [[ ${key} == *[!0-9]* ]] && return 1
-        # '08' and '09' are invalid octal: bare (( )) on them raises
-        # "value too great for base", which aborts the whole script. Force
-        # base 10, and refuse anything long enough to overflow.
-        (( ${#key} > 3 )) && return 1
-        key=$((10#${key}))
-        (( key < 1 || key > m )) && return 1
-        MENU_INDEX=$((key-1))
-        return 0
+        # Re-prompt on a typo. Returning 1 here reads as "cancelled" to the
+        # caller, and in main_menu that quits the whole program.
+        while :; do
+            printf 'select [1-%d, q]: ' "${m}"
+            read -r key || key=q
+            [[ ${key} == [Qq]* ]] && return 1
+            if [[ -z ${key} || ${key} == *[!0-9]* ]]; then
+                printf '  enter a number between 1 and %d, or q to go back\n' "${m}"
+                continue
+            fi
+            # '08' and '09' are invalid octal: a bare (( )) on them raises
+            # "value too great for base" and aborts the whole script.
+            if (( ${#key} > 3 )); then
+                printf '  out of range\n'; continue
+            fi
+            key=$((10#${key}))
+            if (( key < 1 || key > m )); then
+                printf '  out of range\n'; continue
+            fi
+            MENU_INDEX=$((key-1))
+            return 0
+        done
     fi
 
     enter_alt
@@ -305,7 +336,46 @@ ui_menu() {
         printf '\033[H\033[2J'
         banner
         printf '  %s%s%s\n' "${BOLD}${TITLE}" "${title}" "${RESET}"
-        for (( i = 0; i < n; i++ )); do
+
+        # The frame is banner + title + options + footer. On an 80x24 terminal
+        # a 21-line option list pushes the banner and the selected row off the
+        # top, so the pointer is invisible and Enter fires something unseen.
+        # Show a window around the cursor instead.
+        local rows budget first last j used full
+        rows=$(term_height)
+        # Banner 6 + title 1 + footer 3. Count RENDERED rows, not entries: a
+        # heading prints a blank line then its text, so it costs two.
+        budget=$(( rows - 10 ))
+        (( budget < 4 )) && budget=4
+        full=0
+        for (( j = 0; j < n; j++ )); do
+            if [[ ${opts[j]} == --* ]]; then full=$(( full + 2 )); else full=$(( full + 1 )); fi
+        done
+        if (( full <= budget )); then
+            first=0; last=$(( n - 1 ))
+        else
+            # Two marker lines eat into the budget once we are windowing.
+            budget=$(( budget - 2 ))
+            (( budget < 2 )) && budget=2
+            first=${sel[cur]}; last=${sel[cur]}; used=1
+            while :; do
+                if (( first > 0 )); then
+                    j=$(( first - 1 ))
+                    [[ ${opts[j]} == --* ]] && used=$(( used + 2 )) || used=$(( used + 1 ))
+                    (( used > budget )) && break
+                    first=${j}
+                fi
+                if (( last < n - 1 )); then
+                    j=$(( last + 1 ))
+                    [[ ${opts[j]} == --* ]] && used=$(( used + 2 )) || used=$(( used + 1 ))
+                    (( used > budget )) && break
+                    last=${j}
+                fi
+                (( first == 0 && last == n - 1 )) && break
+            done
+        fi
+        (( first > 0 )) && printf '    %s... %d more above%s\n' "${MUTED}" "${first}" "${RESET}"
+        for (( i = first; i <= last; i++ )); do
             if [[ ${opts[i]} == "--" ]]; then
                 printf '\n'
             elif [[ ${opts[i]} == --* ]]; then
@@ -316,6 +386,7 @@ ui_menu() {
                 printf '    %s%s%s\n' "${MUTED}" "${opts[i]}" "${RESET}"
             fi
         done
+        (( last < n - 1 )) && printf '    %s... %d more below%s\n' "${MUTED}" "$(( n - 1 - last ))" "${RESET}"
         printf '\n  %s%s%s\n' "${MUTED}" \
             "$(repeat_char "${G_H}" $((w-4)))" "${RESET}"
         printf '  %sup/down or j/k to move  %s  enter to select  %s  q to quit%s\n' \
@@ -325,23 +396,31 @@ ui_menu() {
         # count as a selection -- otherwise a closed stdin activates an item.
         IFS= read -rsn1 key || { leave_alt; return 1; }
         if [[ ${key} == $'\033' ]]; then
-            read -rsn2 -t 0.05 rest || rest=""
-            # Modified arrows and function keys are longer than three bytes:
-            # Ctrl+Up is ESC[1;5A. Without draining to the terminator the tail
-            # arrives as separate keystrokes and the '5' lands in the digit
-            # branch below, silently launching menu item 5.
-            if [[ ${rest} == '['* ]]; then
-                local guard=0
-                while (( guard++ < 8 )); do
-                    case ${rest: -1} in
-                        [A-Za-z~]) break ;;
-                    esac
-                    read -rsn1 -t 0.05 more || break
+            # One byte at a time, with IFS= so whitespace is kept. Reading two
+            # at once made Alt+<letter> swallow the next keystroke; letting IFS
+            # strip the byte made Alt+Space indistinguishable from a bare
+            # Escape, which quits the menu. The read's exit status is what
+            # separates "a byte arrived" from "nothing came".
+            rest=""; more=""; local got=0
+            IFS= read -rsn1 -t 0.05 more && got=1
+            rest=${more}
+            if [[ ${rest} == '[' || ${rest} == 'O' ]]; then
+                # CSI or SS3: drain to the final byte, so the tail of a
+                # modified arrow (ESC[1;5A) cannot reach the digit branch.
+                guard=0
+                while (( guard++ < 10 )); do
+                    more=""
+                    read -rsn1 -t 0.05 more
                     [[ -z ${more} ]] && break
                     rest+="${more}"
+                    case ${more} in [A-Za-z~]) break ;; esac
                 done
+                key="ESC${rest:0:2}"
+            elif (( got )); then
+                key="ESC-meta"      # Alt+<char>, including Alt+Space
+            else
+                key="ESC"           # nothing followed: bare Escape, cancel
             fi
-            key="ESC${rest:0:2}"
         fi
         case ${key} in
             'ESC[A'|k|K) (( cur-- )); (( cur < 0 )) && cur=$((m-1)) ;;
@@ -430,6 +509,10 @@ fido_pin_state() {
     line=$(printf '%s\n' "${out}" | grep -i '^PIN:' | head -1)
     if [[ -z ${line} ]]; then printf 'unknown -'; return 1; fi
     if [[ ${line} == *[Nn]ot\ set* ]]; then printf 'unset -'; return 0; fi
+    # These arrive as separate lines, so the PIN: line still says "N attempts"
+    # and the applet looks healthy when it is not usable.
+    if [[ ${out} == *"temporarily blocked"* ]]; then printf 'tempblocked -'; return 0; fi
+    if [[ ${out} == *"must be changed"* ]]; then printf 'mustchange -'; return 0; fi
     if [[ ${line} =~ ([0-9]+)[[:space:]]*attempt ]]; then
         printf 'set %s' "${BASH_REMATCH[1]}"; return 0
     fi
@@ -606,6 +689,13 @@ check_all() {
             disabled|unsupported)
                 warn "FIDO2 PIN reported as ${state} by ykman"
                 (( WARN_COUNT++ )) ;;
+            tempblocked)
+                bad "FIDO2 PIN is temporarily blocked -- unplug and re-insert the key"
+                (( FAIL_COUNT++ )) ;;
+            mustchange)
+                bad "the FIDO2 PIN must be changed before it can be used"
+                note "ykman fido access change-pin"
+                (( FAIL_COUNT++ )) ;;
             *)
                 info "FIDO2 PIN state unknown (is the key plugged in?)" ;;
         esac
@@ -624,11 +714,11 @@ check_all() {
         bad "user.signingkey points at a .pub file: ${val}"
         note "with a .pub, ssh-keygen asks the agent instead of the token"
         (( FAIL_COUNT++ ))
-    elif [[ ! -f ${val} ]]; then
+    elif [[ ! -f $(expand_tilde "${val}") ]]; then
         bad "user.signingkey file does not exist: ${val}"; (( FAIL_COUNT++ ))
     else
         ok "user.signingkey = ${val}"
-        if [[ ${val} == "${HOME}/.ssh/"* ]]; then
+        if [[ $(expand_tilde "${val}") == "${HOME}/.ssh/"* ]]; then
             warn "the key lives in ~/.ssh -- gcr-ssh-agent will advertise it and break signing"
             (( WARN_COUNT++ ))
         fi
@@ -642,13 +732,13 @@ check_all() {
     if [[ -z ${val} ]]; then
         warn "gpg.ssh.allowedSignersFile is unset -- you cannot verify your own signatures locally"
         (( WARN_COUNT++ ))
-    elif [[ ! -f ${val} ]]; then
+    elif [[ ! -f $(expand_tilde "${val}") ]]; then
         warn "allowed_signers file missing: ${val}"; (( WARN_COUNT++ ))
     else
         ok "allowed_signers = ${val}"
         if [[ -f ${KEY_PUB} ]]; then
             blob=$(pub_blob "${KEY_PUB}")
-            if grep -qF -- "${blob#* }" "${val}" 2>/dev/null; then
+            if grep -qF -- "${blob#* }" "$(expand_tilde "${val}")" 2>/dev/null; then
                 ok "signing key is listed in allowed_signers"
             else
                 warn "signing key is NOT listed in allowed_signers"; (( WARN_COUNT++ ))
@@ -864,16 +954,37 @@ ya_verify() {
 
     for ks in hkps://keys.openpgp.org hkps://keyserver.ubuntu.com; do
         info "fetching the signing key from ${ks#hkps://}"
-        if GNUPGHOME="${gnupghome}" gpg --batch --quiet \
-                --keyserver "${ks}" --recv-keys "${issuer}" 2>/dev/null; then
+        GNUPGHOME="${gnupghome}" gpg --batch --quiet \
+            --keyserver "${ks}" --recv-keys "${issuer}" 2>/dev/null
+        # gpg exits 0 for "new key but contains no user ID - skipped", which
+        # keys.openpgp.org returns for several Yubico signers. Taking that as
+        # success skips the next keyserver and the verify then fails with
+        # NO_PUBKEY, which we would have reported as a BAD SIGNATURE.
+        if GNUPGHOME="${gnupghome}" gpg --batch --list-keys "${issuer}" \
+                >/dev/null 2>&1; then
             rc=0; break
         fi
+        info "${ks#hkps://} returned no usable key, trying the next one"
     done
     if (( rc != 0 )); then
+        # Last resort: the user's own keyring. The hints below used to tell
+        # people to 'gpg --recv-keys' into ~/.gnupg and re-run, which could
+        # never help, because this function only ever looked at keyservers.
+        if gpg --batch --export "${issuer}" 2>/dev/null \
+                | GNUPGHOME="${gnupghome}" gpg --batch --quiet --import 2>/dev/null \
+           && GNUPGHOME="${gnupghome}" gpg --batch --list-keys "${issuer}" >/dev/null 2>&1; then
+            info "using the copy already in your own keyring"
+            rc=0
+        fi
+    fi
+    if (( rc != 0 )); then
         bad "could not fetch the signing key -- refusing to install unverified"
-        note "fetch it by hand and verify yourself:"
+        # Deliberately not printing the download paths: the caller removes the
+        # working directory as soon as this returns, so a command naming them
+        # would fail with "No such file or directory".
+        note "import the key, then run this step again:"
         note "  gpg --recv-keys ${issuer}"
-        note "  gpg --verify ${sig} ${tarball}"
+        note "check it against ${YA_SIGNING_URL} first"
         ya_gpg_cleanup "${gnupghome}"; return 1
     fi
 
@@ -882,8 +993,19 @@ ya_verify() {
     ya_gpg_cleanup "${gnupghome}"
 
     if ! grep -q '^\[GNUPG:\] GOODSIG' <<<"${status}"; then
-        bad "BAD SIGNATURE -- the download does not match the signature"
-        note "do not install it; delete it and try again"
+        # Say which failure it is. "BAD SIGNATURE" for a missing or expired key
+        # accuses the file of something it did not do.
+        if grep -q '^\[GNUPG:\] NO_PUBKEY' <<<"${status}"; then
+            bad "no public key for this signature -- cannot verify"
+            note "fetch it yourself and retry:  gpg --recv-keys ${issuer}"
+        elif grep -q '^\[GNUPG:\] EXPKEYSIG' <<<"${status}"; then
+            bad "the signing key has expired -- not installing"
+        elif grep -q '^\[GNUPG:\] REVKEYSIG' <<<"${status}"; then
+            bad "the signing key has been REVOKED -- do not install this"
+        else
+            bad "BAD SIGNATURE -- the download does not match the signature"
+            note "the download has been discarded; do not try to recover it"
+        fi
         return 1
     fi
     primary=$(awk '/^\[GNUPG:\] VALIDSIG/ { print $12 }' <<<"${status}" | head -1)
@@ -909,7 +1031,7 @@ ya_verify() {
 
 install_yubico_authenticator() {
     local arch version base url sig_url workdir tarball sig size staging backup c
-    local listing vlisting
+    local listing
 
     for c in curl tar; do
         command -v "${c}" >/dev/null 2>&1 || { bad "${c} is required"; return 1; }
@@ -983,17 +1105,17 @@ install_yubico_authenticator() {
         bad "the archive contains absolute or parent paths -- refusing to unpack"
         rm -rf "${workdir}"; return 1
     fi
-    # A symlink or hardlink whose target escapes the staging directory is the
-    # standard way round a name-only check, and -t alone does not show targets.
-    vlisting=$(tar -tvzf "${tarball}" 2>/dev/null)
-    if grep -qE '^[lh].*(->|link to) +(/|\.\./)' <<<"${vlisting}"; then
-        bad "the archive contains links pointing outside it -- refusing to unpack"
-        rm -rf "${workdir}"; return 1
-    fi
 
     mkdir -p "${HOME}/.local/opt" || { rm -rf "${workdir}"; return 1; }
     staging=$(mktemp -d "${HOME}/.local/opt/.ya-stage-XXXXXX") || {
         rm -rf "${workdir}"; return 1
+    }
+    # The link check below resolves each target with realpath, so the staging
+    # path has to be resolved too. If ~/.local or ~/.local/opt is a symlink --
+    # stow and dotfile managers do this -- every legitimate link would resolve
+    # to a different prefix and the install would be refused.
+    staging=$(realpath -- "${staging}" 2>/dev/null) || {
+        bad "could not resolve the staging directory"; rm -rf "${workdir}"; return 1
     }
     blank
     info "unpacking"
@@ -1005,6 +1127,29 @@ install_yubico_authenticator() {
     fi
     rm -rf "${workdir}"
 
+    # Link containment, checked AFTER extraction by resolving each link.
+    #
+    # Matching the target text from 'tar -tv' is both too narrow and too broad:
+    # it misses './../..', bare '..' and 'a/../../..', while rejecting a
+    # perfectly legal '../sibling' that stays inside the archive. GNU tar also
+    # rewrites hardlink targets before printing them, so that half never fires.
+    # Resolving the extracted link is the only test that means anything.
+    local l target bad_link=""
+    while IFS= read -r l; do
+        [[ -z ${l} ]] && continue
+        target=$(realpath -m -- "${l}" 2>/dev/null) || target=""
+        case ${target} in
+            "${staging}"|"${staging}"/*) ;;
+            *) bad_link=${l}; break ;;
+        esac
+    done < <(find "${staging}" -type l 2>/dev/null)
+    if [[ -n ${bad_link} ]]; then
+        bad "the archive contains a link pointing outside it -- refusing"
+        note "${bad_link#"${staging}"/} -> $(readlink -- "${bad_link}" 2>/dev/null)"
+        rm -rf "${staging}"; return 1
+    fi
+
+    # -x follows symlinks, so this must come after the containment check.
     if [[ ! -x ${staging}/authenticator ]]; then
         bad "no 'authenticator' binary in the archive -- not installing"
         rm -rf "${staging}"; return 1
@@ -1050,8 +1195,12 @@ install_yubico_authenticator() {
     note "FIDO2 (PIN, passkeys) goes over USB HID -- udev handles access"
     note "PIV and OATH go over the smartcard interface -- that needs pcscd"
     blank
-    apt_install pcscd
-    if command -v systemctl >/dev/null 2>&1; then
+    # Guard exactly as step_piv_teleport does: without this, declining the
+    # install leads to an offer to enable a unit that does not exist.
+    if ! apt_install pcscd || \
+       ! dpkg-query -W -f='${Status}' pcscd 2>/dev/null | grep -q 'ok installed'; then
+        warn "pcscd is not installed -- PIV and OATH will not work in the app"
+    elif command -v systemctl >/dev/null 2>&1; then
         if systemctl is-active --quiet pcscd.socket || systemctl is-active --quiet pcscd; then
             ok "pcscd is running"
         elif systemctl is-enabled --quiet pcscd.socket 2>/dev/null; then
@@ -1078,7 +1227,8 @@ install_yubico_authenticator_flatpak() {
     if ! command -v flatpak >/dev/null 2>&1; then
         apt_install flatpak || return 1
     fi
-    if ! flatpak remotes 2>/dev/null | grep -q flathub; then
+    # --user install needs a USER-scope remote; a system one does not satisfy it
+    if ! flatpak remotes --user 2>/dev/null | grep -q flathub; then
         info "adding the flathub remote (user scope)"
         run_interactive flatpak remote-add --if-not-exists --user \
             flathub https://dl.flathub.org/repo/flathub.flatpakrepo
@@ -1107,8 +1257,11 @@ step_install_tools() {
         note "${YKMAN_BROKEN_SNAP}"
         if confirm "Remove the broken snap?" n; then
             run_interactive sudo snap remove yubikey-manager
-        else
+        elif [[ -x /usr/bin/ykman ]] && /usr/bin/ykman --version >/dev/null 2>&1; then
             note "use the full path /usr/bin/ykman to avoid it"
+        else
+            note "install the apt package to get a working ykman:"
+            note "  sudo apt-get install yubikey-manager"
         fi
     fi
 
@@ -1140,7 +1293,8 @@ step_fido_init() {
     section "FIDO2 applet setup"
 
     if ! detect_ykman; then
-        bad "ykman is not available -- run step 1 first"
+        bad "ykman is not available"
+        note "run 'Install the YubiKey management tools' from the menu first"
         pause; return 1
     fi
     require_device || { pause; return 1; }
@@ -1162,12 +1316,24 @@ step_fido_init() {
             fi
             ;;
         set)
-            ok "a FIDO2 PIN is already set${retries:+ (${retries} attempts remaining)}"
+            if [[ ${retries} == "-" ]]; then
+                ok "a FIDO2 PIN is already set"
+            else
+                ok "a FIDO2 PIN is already set (${retries} attempts remaining)"
+            fi
             blank
             if confirm "Change the FIDO2 PIN?" n; then
                 hint "You will be asked for the CURRENT FIDO2 PIN first."
                 run_interactive "${YKMAN}" fido access change-pin
             fi
+            ;;
+        tempblocked)
+            bad "the FIDO2 PIN is temporarily blocked"
+            note "unplug the YubiKey and put it back in to clear this"
+            ;;
+        mustchange)
+            warn "the FIDO2 PIN must be changed before it can be used"
+            confirm "Change it now?" y && run_interactive "${YKMAN}" fido access change-pin
             ;;
         blocked)
             bad "the FIDO2 PIN is BLOCKED -- every attempt has been used"
@@ -1217,6 +1383,10 @@ backup_existing_key() {
 }
 
 # If key creation fails we must not leave git pointing at a missing file.
+# The new key is in place; the backup is now just an old file on disk, not
+# something to be put back. Clearing the markers disarms abort_cleanup.
+backup_commit() { BACKUP_PRIV=""; BACKUP_PUB=""; }
+
 restore_backup() {
     local restored=0
     [[ -n ${BACKUP_PRIV} && -f ${BACKUP_PRIV} ]] && mv "${BACKUP_PRIV}" "${KEY_PRIV}" && restored=1
@@ -1308,15 +1478,25 @@ step_create_key() {
     if detect_ykman; then
         read -r state retries <<<"$(fido_pin_state)"
         if [[ ${state} == unset ]]; then
-            bad "no FIDO2 PIN is set -- run step 2 first"
+            bad "no FIDO2 PIN is set"
+            note "run 'Set the FIDO2 PIN' from the menu first"
             note "a resident credential cannot be created without a PIN"
             pause; return 1
         fi
-        if [[ ${state} == blocked ]]; then
-            bad "the FIDO2 PIN is blocked -- ssh-keygen cannot create a credential"
-            note "clearing it needs a FIDO2 reset, which wipes every credential"
-            pause; return 1
-        fi
+        case ${state} in
+            tempblocked)
+                bad "the FIDO2 PIN is temporarily blocked -- ssh-keygen would fail"
+                note "unplug the YubiKey and put it back in, then try again"
+                pause; return 1 ;;
+            mustchange)
+                bad "the FIDO2 PIN must be changed before it can be used"
+                note "run 'Set the FIDO2 PIN' from the menu, or: ykman fido access change-pin"
+                pause; return 1 ;;
+            blocked)
+                bad "the FIDO2 PIN is blocked -- every attempt has been used"
+                note "only a FIDO2 reset clears this, and it wipes every credential"
+                pause; return 1 ;;
+        esac
         [[ ${retries} != "-" ]] && info "FIDO2 PIN: ${retries} attempts remaining"
     fi
 
@@ -1363,6 +1543,7 @@ step_create_key() {
         pause; return 1
     fi
 
+    backup_commit
     chmod 700 "${KEY_DIR}"; chmod 600 "${KEY_PRIV}"; chmod 644 "${KEY_PUB}"
     configure_git "${email}"
     update_allowed_signers "${KEY_PUB}" "${email}"
@@ -1462,10 +1643,13 @@ step_askpass() {
     blank
     if confirm "Set SSH_ASKPASS for GUI sessions (${ENV_FILE})?" y; then
         mkdir -p "${ENV_DIR}"
-        {
+        if ! {
             printf '# written by yubikey-git-signing.sh\n'
             printf 'SSH_ASKPASS=%s\n' "${bin}"
-        } > "${ENV_FILE}"
+        } > "${ENV_FILE}"; then
+            bad "could not write ${ENV_FILE}"
+            pause; return 1
+        fi
         ok "wrote ${ENV_FILE}"
         note "systemd user sessions read this at login -- log out and back in"
 
@@ -1522,17 +1706,22 @@ step_github_instructions() {
             run_interactive gh ssh-key add "${KEY_PUB}" --type signing --title "YubiKey git signing"
         fi
     fi
+    # Explicit: without this the function returns whatever the last command
+    # said, so declining the upload, or a failed gh, would read as the no-key
+    # early return and the caller would skip its pause.
+    return 0
 }
 
-# step_github_instructions pauses itself on its no-key early return, so only
-# pause here when it got far enough to print the enrolment steps.
-step_github() { step_github_instructions && pause; }
+# step_github_instructions returns non-zero ONLY on its no-key early return,
+# where it has already paused. Any other outcome -- including a failed
+# 'gh ssh-key add' -- must still pause, or the menu redraw wipes the error.
+step_github() { step_github_instructions || return 0; pause; }
 
 # ----------------------------------------------------------------------------
 # Remediation: un-advertise the key from a running agent
 # ----------------------------------------------------------------------------
 fix_agent_core() {
-    local blob
+    local blob listing
 
     if [[ ! -f ${KEY_PUB} ]]; then
         warn "no signing key yet -- nothing to un-advertise"
@@ -1540,7 +1729,8 @@ fix_agent_core() {
     fi
 
     blob=$(pub_blob "${KEY_PUB}"); blob=${blob#* }
-    if ! ssh-add -L 2>/dev/null | grep -qF -- "${blob}"; then
+    listing=$(ssh-add -L 2>/dev/null)
+    if ! grep -qF -- "${blob}" <<<"${listing}"; then
         ok "no agent is advertising the signing key -- nothing to do"
         return 0
     fi
@@ -1556,7 +1746,8 @@ fix_agent_core() {
         run_interactive ssh-add -d "${KEY_PUB}"
     fi
 
-    if ssh-add -L 2>/dev/null | grep -qF -- "${blob}"; then
+    listing=$(ssh-add -L 2>/dev/null)
+    if grep -qF -- "${blob}" <<<"${listing}"; then
         blank
         warn "still advertised -- the agent needs a restart"
         if confirm "Restart gcr-ssh-agent?" y; then
@@ -1565,7 +1756,8 @@ fix_agent_core() {
     fi
 
     blank
-    if ssh-add -L 2>/dev/null | grep -qF -- "${blob}"; then
+    listing=$(ssh-add -L 2>/dev/null)
+    if grep -qF -- "${blob}" <<<"${listing}"; then
         bad "the key is still advertised"
         note "fall back to a wrapper script set as gpg.ssh.program that does:"
         note '  unset SSH_AUTH_SOCK; exec /usr/bin/ssh-keygen "$@"'
@@ -1602,6 +1794,18 @@ step_fix_agent() {
 TELEPORT_ENV_FILE="${ENV_DIR}/20-teleport.conf"
 
 # true when $1 >= $2, comparing dotted version strings
+# ykman can only report whether the PIN, PUK and management key are still the
+# factory values on firmware 5.3 and later: yubikit's *_metadata calls are
+# version-gated and ykman swallows the NotSupportedError. On older firmware the
+# warnings simply never appear, and reading that absence as "not default" would
+# have us offer a destructive reset on a factory-fresh key.
+piv_reports_defaults() {
+    local v
+    v=$(printf '%s\n' "$1" | sed -n 's/^PIV version:[[:space:]]*//p' | head -1)
+    [[ -z ${v} ]] && return 1
+    ver_at_least "${v}" 5.3.0
+}
+
 ver_at_least() {
     [[ $(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1) == "$2" ]]
 }
@@ -1622,20 +1826,32 @@ piv_slot_policy() {
 # by inode, never by path, so the inode has to be matched the long way round.
 pcsc_holders() {
     local inode p exe fds
+    local seen=" "
     for inode in $(ss -x 2>/dev/null | grep pcscd.comm \
                    | grep -oE '[0-9]{5,}' | sort -u); do
         for p in /proc/[0-9]*; do
+            # One line per process: a client with several sockets would
+            # otherwise be reported, and counted, once per connection.
+            [[ ${seen} == *" ${p##*/} "* ]] && continue
             # not piped into grep -q: under pipefail an early grep exit
             # SIGPIPEs ls, the pipeline returns 141 and a matching process is
             # skipped. Read the listing, then test it.
             fds=$(ls -l "${p}/fd" 2>/dev/null) || continue
             grep -q "socket:\[${inode}\]" <<<"${fds}" || continue
             exe=$(readlink "${p}/exe" 2>/dev/null)
+            # ss -x lists both ends of each connection, so the daemon's own
+            # inode is in the set. Reporting "pcscd is connected to pcscd" as
+            # a warning is noise, and now a counted one.
+            case ${exe##*/} in pcscd) continue ;; esac
+            seen+="${p##*/} "
             # A mapping marked (deleted) means the library was removed out from
             # under a long-lived process: the connection dies with it and
             # cannot come back.
             # the marker is space-separated at end of line, not glued to the path
-            if grep -qE '(opensc|pkcs11|pcsclite)[^ ]* \(deleted\)$' "${p}/maps" 2>/dev/null; then
+            # Anchored at the last '/': without that, 'pkcs11' matched the
+            # directory in /usr/lib/.../pkcs11/p11-kit-trust.so and any deleted
+            # library under it marked the process stale.
+            if grep -qE '/[^/ ]*(opensc|pkcs11|pcsclite)[^/ ]* \(deleted\)$' "${p}/maps" 2>/dev/null; then
                 printf '%s|%s|stale\n' "${p##*/}" "${exe##*/}"
             else
                 printf '%s|%s|live\n' "${p##*/}" "${exe##*/}"
@@ -1662,7 +1878,7 @@ piv_slot_report() {
 
         if [[ -z ${cert} ]]; then
             if (( has_key )); then
-                warn "${slot}  ${policy}: key present, no certificate"
+                rwarn "${slot}  ${policy}: key present, no certificate"
                 note "tsh overwrites this slot with no prompt"
             else
                 ok "${slot}  ${policy}: empty -- tsh will generate here"
@@ -1678,7 +1894,7 @@ piv_slot_report() {
             *"O = teleport"*|*"O=teleport"*)
                 ok "${slot}  ${policy}: already a Teleport slot -- tsh reuses it" ;;
             *)
-                warn "${slot}  ${policy}: certificate belongs to something else"
+                rwarn "${slot}  ${policy}: certificate belongs to something else"
                 [[ -n ${subject} ]] && note "${subject#subject=}"
                 note "tsh prints this certificate and asks before overwriting" ;;
         esac
@@ -1761,22 +1977,28 @@ piv_teleport_report() {
     printf '%s\n' "${pivinfo}" | grep -E '^(PIV version|PIN tries|PUK tries)' \
         | while read -r line; do note "${line}"; done
 
-    if printf '%s' "${pivinfo}" | grep -q 'default Management key'; then
+    if ! piv_reports_defaults "${pivinfo}"; then
+        info "this firmware cannot report whether the PIN, PUK and management"
+        note "key are still the factory values (needs PIV 5.3+), so they are"
+        note "not checked here"
+    elif printf '%s' "${pivinfo}" | grep -q 'default Management key'; then
         ok "management key is the factory default -- which is what tsh needs"
     else
         rwarn "management key is NOT the factory default"
         note "tsh fails with 'smart card error 6982' unless you reset PIV or"
         note "generate the slot key yourself; see --help for the reset option"
     fi
-    if printf '%s' "${pivinfo}" | grep -q 'default PIN'; then
-        rwarn "PIV PIN is still the factory default (123456)"
-    else
-        ok "PIV PIN has been changed from the default"
-    fi
-    if printf '%s' "${pivinfo}" | grep -q 'default PUK'; then
-        rwarn "PUK is still the factory default (12345678)"
-    else
-        ok "PUK has been changed from the default"
+    if piv_reports_defaults "${pivinfo}"; then
+        if printf '%s' "${pivinfo}" | grep -q 'default PIN'; then
+            rwarn "PIV PIN is still the factory default (123456)"
+        else
+            ok "PIV PIN has been changed from the default"
+        fi
+        if printf '%s' "${pivinfo}" | grep -q 'default PUK'; then
+            rwarn "PUK is still the factory default (12345678)"
+        else
+            ok "PUK has been changed from the default"
+        fi
     fi
 
     blank
@@ -1838,11 +2060,14 @@ exclude_pkcs11_module() {
         confirm "Replace it?" y || { info "left alone"; return 0; }
     fi
 
-    {
+    if ! {
         printf '# written by yubikey-git-signing.sh\n'
         grep -vE '^[[:space:]]*(#|$)|^disable-in:' "${sys}"
         printf 'disable-in: %s\n' "${want// /, }"
-    } > "${user}"
+    } > "${user}"; then
+        bad "could not write ${user}"
+        return 1
+    fi
     ok "wrote ${user}"
     note "will no longer load ${mod}: ${want}"
     note "a program already running keeps it until it restarts"
@@ -1870,10 +2095,16 @@ step_piv_teleport() {
     # --- pcscd ---
     if ! dpkg-query -W -f='${Status}' pcscd 2>/dev/null | grep -q "ok installed"; then
         if confirm "Install pcscd now?" y; then
-            apt_install pcscd
-            command -v systemctl >/dev/null 2>&1 && \
-                confirm "Enable pcscd.socket?" y && \
-                run_interactive sudo systemctl enable --now pcscd.socket
+            # Only offer to enable the unit if the package actually arrived:
+            # otherwise this prompts to enable something that does not exist.
+            if apt_install pcscd && \
+               dpkg-query -W -f='${Status}' pcscd 2>/dev/null | grep -q 'ok installed'; then
+                command -v systemctl >/dev/null 2>&1 && \
+                    confirm "Enable pcscd.socket?" y && \
+                    run_interactive sudo systemctl enable --now pcscd.socket
+            else
+                warn "pcscd was not installed -- Teleport will not reach the PIV applet"
+            fi
         fi
         blank
     fi
@@ -1908,6 +2139,35 @@ step_piv_teleport() {
         fi
     fi
     if [[ -n ${YKMAN} && -n ${pivinfo} ]]; then
+        # Offered BEFORE the PIN and PUK prompts: a reset returns both to the
+        # factory values, so asking afterwards would silently undo whatever
+        # the user had just set.
+        if piv_reports_defaults "${pivinfo}" && \
+           ! printf '%s' "${pivinfo}" | grep -q 'default Management key'; then
+            blank
+            warn "the management key is not the factory default"
+            note "tsh needs the default one; resetting PIV restores it and wipes"
+            note "every PIV key and certificate. FIDO2 is a separate applet, so"
+            note "your git signing key is NOT affected."
+            if confirm_typed RESET "This erases all PIV keys and certificates."; then
+                if run_interactive "${YKMAN}" piv reset; then
+                    # The reset put the PIN and PUK back to 123456 / 12345678,
+                    # so the checks below must see the NEW state. If the re-read
+                    # comes back empty (key pulled, pcscd hiccup) keep the old
+                    # text rather than silently skipping both prompts.
+                    local after
+                    after=$(timeout 20 "${YKMAN}" piv info 2>/dev/null)
+                    if [[ -n ${after} ]]; then
+                        pivinfo=${after}
+                    else
+                        warn "could not re-read the PIV applet after the reset"
+                        note "the PIN and PUK are back to 123456 / 12345678 --"
+                        note "run this step again to change them"
+                    fi
+                fi
+            fi
+        fi
+
         if printf '%s' "${pivinfo}" | grep -q 'default PIN'; then
             blank
             warn "the PIV PIN is still the factory default"
@@ -1925,16 +2185,6 @@ step_piv_teleport() {
                 run_interactive "${YKMAN}" piv access change-puk
             fi
         fi
-        if ! printf '%s' "${pivinfo}" | grep -q 'default Management key'; then
-            blank
-            warn "the management key is not the factory default"
-            note "tsh needs the default one; resetting PIV restores it and wipes"
-            note "every PIV key and certificate. FIDO2 is a separate applet, so"
-            note "your git signing key is NOT affected."
-            if confirm_typed RESET "This erases all PIV keys and certificates."; then
-                run_interactive "${YKMAN}" piv reset
-            fi
-        fi
     fi
 
     # --- agent isolation ---
@@ -1945,15 +2195,18 @@ step_piv_teleport() {
     blank
     if confirm "Pin TELEPORT_ADD_KEYS_TO_AGENT=no (${TELEPORT_ENV_FILE})?" y; then
         mkdir -p "${ENV_DIR}"
-        {
+        if ! {
             printf '# written by yubikey-git-signing.sh\n'
             printf 'TELEPORT_ADD_KEYS_TO_AGENT=no\n'
-        } > "${TELEPORT_ENV_FILE}"
+        } > "${TELEPORT_ENV_FILE}"; then
+            bad "could not write ${TELEPORT_ENV_FILE}"
+        else
         ok "wrote ${TELEPORT_ENV_FILE}"
         note "systemd user sessions read this at login -- log out and back in"
         blank
         hint "for terminals before that, add this to ~/.bashrc yourself:"
         hint "  export TELEPORT_ADD_KEYS_TO_AGENT=no"
+        fi
     fi
 
     blank
@@ -1981,7 +2234,10 @@ step_piv_teleport() {
 # to a scratch service, proven with pamtester, and committed behind a timer
 # that puts the old files back unless you cancel it.
 # ----------------------------------------------------------------------------
-PAM_U2F_FILE="/etc/pam.d/common-u2f"
+PAM_DIR="${PAM_DIR:-/etc/pam.d}"
+# libpam searches /etc/pam.d first, then this vendor directory.
+PAM_VENDOR_DIR="${PAM_VENDOR_DIR:-/usr/lib/pam.d}"
+PAM_U2F_FILE="${PAM_DIR}/common-u2f"
 PAM_TEST_SVC="/etc/pam.d/yubikey-pam-test"
 PAM_PROBE_SVC="/etc/pam.d/yubikey-pam-probe"
 # One default, used by BOTH the stanza and registration: if they ever
@@ -1993,6 +2249,16 @@ PAM_MARKER="# managed by yubikey-git-signing.sh"
 PAM_CORE_SERVICES="sudo sudo-i login gdm-password"
 
 # A glob is NOT expanded inside [[ -e ]], so this has to be a real expansion.
+# git expands a leading ~ in path settings; [[ -f ~/x ]] on the literal string
+# does not, so a perfectly good config reads as a missing file.
+expand_tilde() {
+    case $1 in
+        "~")    printf '%s' "${HOME}" ;;
+        "~/"*)  printf '%s/%s' "${HOME}" "${1#\~/}" ;;
+        *)      printf '%s' "$1" ;;
+    esac
+}
+
 pam_u2f_present() {
     local f
     for f in /usr/lib/*/security/pam_u2f.so /lib/*/security/pam_u2f.so; do
@@ -2002,12 +2268,17 @@ pam_u2f_present() {
 }
 
 # The authfile= the stanza points at, or pam_u2f's own default.
+# The active pam_u2f line: not a comment, and not the second one.
+pam_u2f_line() {
+    grep -vE '^[[:space:]]*#' "${PAM_U2F_FILE}" 2>/dev/null | grep -m1 'pam_u2f\.so'
+}
+
 pam_map_file() {
     local f
     # [^ ] stops at a space but not a tab, and a hand-edited stanza is often
     # tab-separated: that returned 'path<TAB>cue' and pam_register then wrote a
     # file named after the whole string. Stop at any whitespace.
-    f=$(grep -oE 'authfile=[^[:space:]]+' "${PAM_U2F_FILE}" 2>/dev/null | head -1)
+    f=$(pam_u2f_line | grep -oE 'authfile=[^[:space:]]+' | head -1)
     if [[ -n ${f} ]]; then printf '%s' "${f#authfile=}"; return; fi
     # No authfile= in an EXISTING stanza means pam_u2f is using its own default,
     # which is per-user -- not PAM_MAP_DEFAULT. Registering into the wrong file
@@ -2056,16 +2327,81 @@ pam_mode_label() {
 
 # Services that @include common-u2f.
 pam_includers() {
-    grep -rln 'common-u2f' /etc/pam.d/ 2>/dev/null \
-        | while read -r f; do printf '%s\n' "${f##*/}"; done | sort
+    # Match the directive, not the string: a comment, a note or a sudo~ backup
+    # otherwise counts as a service that reads the stack.
+    local f
+    grep -rlE '^[[:space:]]*@include[[:space:]]+common-u2f[[:space:]]*$' \
+        "${PAM_DIR}/" 2>/dev/null | while read -r f; do
+        f=${f##*/}
+        case ${f} in
+            *~|*.bak|*.orig|*.rpmsave|*.pacsave|*.pacnew|*.dpkg-*|*.ucf-*) continue ;;
+        esac
+        printf '%s\n' "${f}"
+    done | sort
+}
+
+# Does one service actually include the stack?
+pam_service_includes() {
+    grep -qE '^[[:space:]]*@include[[:space:]]+common-u2f[[:space:]]*$' \
+        "${PAM_DIR}/$1" 2>/dev/null
+}
+
+# Core services that already read the stack, and those that do not. Split out
+# so the coverage decision can be exercised without a live /etc/pam.d.
+pam_core_covered() {
+    local svc out=""
+    for svc in ${PAM_CORE_SERVICES}; do
+        [[ -f ${PAM_DIR}/${svc} ]] || continue
+        pam_service_includes "${svc}" && out+="${svc} "
+    done
+    printf '%s' "${out}"
+}
+
+pam_core_uncovered() {
+    local svc out=""
+    for svc in ${PAM_CORE_SERVICES}; do
+        [[ -f ${PAM_DIR}/${svc} ]] || continue
+        pam_service_includes "${svc}" || out+="${svc} "
+    done
+    printf '%s' "${out}"
+}
+
+# Where libpam will actually find a service's config. It searches /etc/pam.d
+# first and then the VENDOR directory /usr/lib/pam.d; only when neither has a
+# file does it fall back to 'other'. polkit-1 is the case that matters: Ubuntu
+# ships no /etc/pam.d/polkit-1, but polkitd ships /usr/lib/pam.d/polkit-1, so
+# pkexec never reaches 'other'.
+pam_service_source() {
+    if [[ -f ${PAM_DIR}/$1 ]]; then printf '%s/%s' "${PAM_DIR}" "$1"
+    elif [[ -f ${PAM_VENDOR_DIR}/$1 ]]; then printf '%s/%s' "${PAM_VENDOR_DIR}" "$1"
+    else printf 'other'; fi
+}
+
+# Same question as pam_has_anchor, but asked of the file the service ACTUALLY
+# reads -- which for polkit-1 is usually the vendor copy, not one in /etc.
+pam_source_has_anchor() {
+    local src
+    src=$(pam_service_source "$1")
+    [[ ${src} == other ]] && return 1
+    grep -qE '^[[:space:]]*@include[[:space:]]+common-auth[[:space:]]*$' "${src}" 2>/dev/null
+}
+
+# A service can only be wired up if it has a common-auth line to anchor to.
+pam_has_anchor() {
+    grep -qE '^[[:space:]]*@include[[:space:]]+common-auth[[:space:]]*$' \
+        "${PAM_DIR}/$1" 2>/dev/null
 }
 
 # Keep whatever options are already there; they encode the admin's choices.
 pam_current_opts() {
-    local line
-    line=$(grep -m1 'pam_u2f\.so' "${PAM_U2F_FILE}" 2>/dev/null)
+    local line rest
+    line=$(pam_u2f_line)
     [[ -z ${line} ]] && { printf 'authfile=%s cue' "${PAM_MAP_DEFAULT}"; return; }
-    printf '%s' "${line#*pam_u2f.so }"
+    # '${line#*pam_u2f.so }' needs a literal space: a tab-separated stanza, or
+    # one with no options at all, returned the WHOLE line as the options.
+    rest=${line#*pam_u2f.so}
+    rest=${rest#"${rest%%[![:space:]]*}"}
+    printf '%s' "${rest}"
 }
 
 # The candidate file for a mode.
@@ -2084,7 +2420,9 @@ pam_stanza() {
 }
 
 # warn(), but counted: a warning the summary ignores is a warning that lies.
-rwarn() { warn "$1"; (( WARN_COUNT++ )); }
+# Explicit status: a function ending in (( x++ )) returns 1 when x was 0,
+# which leaks into any caller that tests it or ends on this call.
+rwarn() { warn "$1"; WARN_COUNT=$(( WARN_COUNT + 1 )); return 0; }
 
 pam_report() {
     local mode map entries svc core extra
@@ -2130,12 +2468,14 @@ pam_report() {
     while read -r svc; do
         [[ -z ${svc} ]] && continue
         if [[ " ${PAM_CORE_SERVICES} " == *" ${svc} "* ]]; then core+="${svc} "
+        elif [[ ${svc} == polkit-1 ]]; then core+="${svc} "   # covered deliberately
         else extra+="${svc} "; fi
     done < <(pam_includers)
     [[ -n ${core} ]] && ok "covers: ${core}"
     if [[ -n ${extra} ]]; then
         rwarn "also covers: ${extra}"
-        note "'other' is the catch-all, so pkexec and polkit prompts go through it too"
+        note "'other' only covers services with no file of their own -- not pkexec,"
+        note "which uses the vendor file /usr/lib/pam.d/polkit-1"
     fi
 }
 
@@ -2155,7 +2495,11 @@ pam_map_merge() {
         grep -v "^${user}:" "${map}" 2>/dev/null
         printf '%s:%s\n' "${existing}" "${cred}"
     else
-        [[ -r ${map} ]] && cat "${map}" 2>/dev/null
+        # Not 'cat': a mapping file written by hand may lack a final newline,
+        # and the new entry would then be glued onto the last line, corrupting
+        # another user's credential and losing this one. awk terminates every
+        # record it prints.
+        [[ -r ${map} ]] && awk '{ print }' "${map}" 2>/dev/null
         printf '%s:%s\n' "${user}" "${cred}"
     fi
     return 0
@@ -2268,7 +2612,11 @@ pam_stage_and_test() {
             *)  info "this must FAIL -- that is the point of the mode" ;;
         esac
         blank
-        confirm "Unplug the YubiKey, then continue" y
+        if ! confirm "Unplug the YubiKey, then continue" y; then
+            info "cancelled -- nothing was changed"
+            run_interactive sudo rm -f "${PAM_TEST_SVC}" "${PAM_PROBE_SVC}" >/dev/null 2>&1
+            return 1
+        fi
         blank
         if run_interactive pamtester "${PAM_TEST_SVC##*/}" "${USER}" authenticate; then
             if [[ ${mode} == or ]]; then
@@ -2286,7 +2634,10 @@ pam_stage_and_test() {
             fi
         fi
         blank
-        confirm "Plug the YubiKey back in, then continue" y
+        # Not a confirm: there is no "no" to honour here, and a question whose
+        # answer is ignored is the same defect this review keeps finding.
+        info "plug the YubiKey back in"
+        pause
     fi
 
     run_interactive sudo rm -f "${PAM_TEST_SVC}" "${PAM_PROBE_SVC}" >/dev/null 2>&1
@@ -2296,46 +2647,102 @@ pam_stage_and_test() {
 
 # One sudo call does the lot.  Order matters: every later sudo goes through the
 # NEW stack, so a rollback scheduled after the swap could never be scheduled.
+# The root script, on stdout. Split out of pam_commit so the harness can
+# run it against a sandboxed /etc/pam.d: this is the most dangerous code in
+# the file and it was previously impossible to exercise without root.
+# The rollback command, on stdout. Restoring the tar cannot delete a file
+# created AFTER it was taken, so every file this run may create is removed
+# explicitly -- each guarded on the backup not containing that path, so a file
+# that existed before is restored rather than deleted.
+pam_undo_command() {
+    local backup=$1 vendor=${2:-} out svc2
+    out="tar xzf '${backup}' -C /etc"
+    out+="; tar tzf '${backup}' | grep -qx 'pam.d/common-u2f' || rm -f '${PAM_U2F_FILE}'"
+    for svc2 in ${vendor}; do
+        out+="; tar tzf '${backup}' | grep -qx 'pam.d/${svc2}' || rm -f '/etc/pam.d/${svc2}'"
+    done
+    printf '%s' "${out}"
+}
+
+pam_root_script() {
+    local mode=$1 opts=$2 narrow=$3 add=${4:-} vendor=${5:-}
+    local backup=$6 stage=$7 undo=$8
+    local svc
+        printf 'set -e\n'
+    printf 'mkdir -p /var/backups\n'
+    printf 'tar czf %q -C /etc pam.d\n' "${backup}"
+    # clear a timer left behind by an earlier run, or systemd-run refuses
+    # the name and set -e aborts us before the swap
+    printf 'systemctl stop %q.timer 2>/dev/null || true\n' "${PAM_ROLLBACK_UNIT}"
+    printf 'systemctl reset-failed %q 2>/dev/null || true\n' "${PAM_ROLLBACK_UNIT}"
+    # dead man's switch, armed BEFORE the swap
+    # Restoring the tar cannot delete a file that was created after it was
+    # taken, so a rolled-back machine would keep an orphan common-u2f and
+    # read as "already configured" next time. Remove it unless the backup
+    # actually contains one.
+    printf 'systemd-run --on-active=180 --unit=%q --description=%q /bin/sh -c %q >/dev/null\n' \
+        "${PAM_ROLLBACK_UNIT}" "revert YubiKey PAM change" \
+        "${undo}"
+    printf 'install -m 0644 -o root -g root %q %q\n' "${stage}" "${PAM_U2F_FILE}"
+    if [[ -n ${narrow} ]]; then
+        for svc in ${narrow}; do
+            printf 'sed -i -E %q /etc/pam.d/%q\n' \
+                '/^[[:space:]]*@include[[:space:]]+common-u2f[[:space:]]*$/d' "${svc}"
+        done
+    fi
+    # Wire the stack into services that do not include it yet. Without this
+    # the file can be swapped in while nothing reads it, and a locking mode
+    # would be reported as active while sudo still takes the password alone.
+    # A service whose only config is the vendor file needs that file copied
+    # into /etc/pam.d first; editing /usr/lib/pam.d would be overwritten by
+    # the next package update.
+    if [[ -n ${vendor} ]]; then
+        for svc in ${vendor}; do
+            # the [ -f ] guard already makes this conditional, and cp -n
+            # warns that its behaviour is non-portable
+            printf '[ -f /etc/pam.d/%q ] || cp %q/%q /etc/pam.d/%q\n' \
+                "${svc}" "${PAM_VENDOR_DIR}" "${svc}" "${svc}"
+            printf 'grep -qE %q /etc/pam.d/%q || sed -i -E %q /etc/pam.d/%q\n' \
+                '^[[:space:]]*@include[[:space:]]+common-u2f[[:space:]]*$' "${svc}" \
+                '0,/^[[:space:]]*@include[[:space:]]+common-auth[[:space:]]*$/s//@include common-u2f\n&/' \
+                "${svc}"
+        done
+    fi
+    if [[ -n ${add} ]]; then
+        for svc in ${add}; do
+            # Same tolerance as pam_service_includes / pam_has_anchor:
+            # a strict ^...$ here would silently match nothing on a file
+            # with an indented or trailing-space include, and the guard
+            # would already have counted the service as wired.
+            printf 'grep -qE %q /etc/pam.d/%q || sed -i -E %q /etc/pam.d/%q\n' \
+                '^[[:space:]]*@include[[:space:]]+common-u2f[[:space:]]*$' "${svc}" \
+                '0,/^[[:space:]]*@include[[:space:]]+common-auth[[:space:]]*$/s//@include common-u2f\n&/' \
+                "${svc}"
+        done
+    fi
+    printf 'rm -f %q %q\n' "${PAM_TEST_SVC}" "${PAM_PROBE_SVC}"
+}
+
 pam_commit() {
-    local mode=$1 opts=$2 narrow=$3 add=${4:-}
+    local mode=$1 opts=$2 narrow=$3 add=${4:-} vendor=${5:-}
     local ts backup rootscript stage svc
 
+    local undo
     ts=$(date +%Y%m%d-%H%M%S)
     backup="/var/backups/pam.d-${ts}.tgz"
+
+    # Restoring the tar cannot delete a file created AFTER it was taken, so
+    # every file this run may create has to be cleaned up explicitly:
+    # common-u2f, and any service copied out of the vendor directory. Each
+    # cleanup is guarded on the backup not containing that path, so a file that
+    # existed before is restored rather than removed.
+    undo=$(pam_undo_command "${backup}" "${vendor}")
     stage=$(mktemp) || return 1
     pam_stanza "${mode}" "${opts}" > "${stage}"
 
     rootscript=$(mktemp) || { rm -f "${stage}"; return 1; }
-    {
-        printf 'set -e\n'
-        printf 'mkdir -p /var/backups\n'
-        printf 'tar czf %q -C /etc pam.d\n' "${backup}"
-        # clear a timer left behind by an earlier run, or systemd-run refuses
-        # the name and set -e aborts us before the swap
-        printf 'systemctl stop %q.timer 2>/dev/null || true\n' "${PAM_ROLLBACK_UNIT}"
-        printf 'systemctl reset-failed %q 2>/dev/null || true\n' "${PAM_ROLLBACK_UNIT}"
-        # dead man's switch, armed BEFORE the swap
-        printf 'systemd-run --on-active=180 --unit=%q --description=%q tar xzf %q -C /etc >/dev/null\n' \
-            "${PAM_ROLLBACK_UNIT}" "revert YubiKey PAM change" "${backup}"
-        printf 'install -m 0644 -o root -g root %q %q\n' "${stage}" "${PAM_U2F_FILE}"
-        if [[ -n ${narrow} ]]; then
-            for svc in ${narrow}; do
-                printf 'sed -i %q /etc/pam.d/%q\n' '/^@include common-u2f$/d' "${svc}"
-            done
-        fi
-        # Wire the stack into services that do not include it yet. Without this
-        # the file can be swapped in while nothing reads it, and a locking mode
-        # would be reported as active while sudo still takes the password alone.
-        if [[ -n ${add} ]]; then
-            for svc in ${add}; do
-                printf 'grep -q %q /etc/pam.d/%q || sed -i %q /etc/pam.d/%q\n' \
-                    '^@include common-u2f$' "${svc}" \
-                    '0,/^@include common-auth$/s//@include common-u2f\n@include common-auth/' \
-                    "${svc}"
-            done
-        fi
-        printf 'rm -f %q %q\n' "${PAM_TEST_SVC}" "${PAM_PROBE_SVC}"
-    } > "${rootscript}"
+    pam_root_script "${mode}" "${opts}" "${narrow}" "${add}" "${vendor}" \
+        "${backup}" "${stage}" "${undo}" > "${rootscript}"
 
     blank
     info "applying, with a 3 minute automatic rollback armed first"
@@ -2358,12 +2765,13 @@ pam_commit() {
     note "fine and the rollback is cancelled. If it does not, do nothing and"
     note "everything goes back by itself."
     blank
-    note "to undo later:  sudo tar xzf ${backup} -C /etc"
+    note "to undo later:"
+    note "  sudo sh -c \"${undo}\""
     return 0
 }
 
 step_pam() {
-    local mode newmode map entries opts narrow svc keys
+    local mode newmode map entries opts narrow svc keys vendor=""
 
     section "YubiKey for sudo and login"
 
@@ -2376,6 +2784,14 @@ step_pam() {
     if ! pam_u2f_present; then
         confirm "Install pam_u2f now?" y || { pause; return 1; }
         apt_install libpam-u2f pamu2fcfg || { pause; return 1; }
+        blank
+    fi
+    # The module and the registration tool ship separately: the module can be
+    # present while pamu2fcfg is not, and registration would then fail.
+    if ! command -v pamu2fcfg >/dev/null 2>&1; then
+        warn "pamu2fcfg is missing -- credentials cannot be registered without it"
+        confirm "Install it?" y && apt_install pamu2fcfg
+        command -v pamu2fcfg >/dev/null 2>&1 || { bad "still not available"; pause; return 1; }
         blank
     fi
 
@@ -2473,25 +2889,67 @@ step_pam() {
         fi
     fi
 
+    # --- pkexec / polkit ---
+    # Deliberately NOT inside the narrowing block: whether pkexec is covered has
+    # nothing to do with whether some unrelated service already includes the
+    # stack, and on a first run there is nothing to narrow at all.
+    if [[ ${newmode} != or ]]; then
+        local psrc
+        psrc=$(pam_service_source polkit-1)
+        # The question is whether polkit-1 READS the stack, not where its file
+        # lives. An /etc/pam.d/polkit-1 that exists but lacks the include --
+        # kept across a release upgrade, or copied to customise -- used to skip
+        # this whole block on a location test and leave pkexec password-only.
+        if ! pam_service_includes polkit-1; then
+            warn "pkexec and the GUI admin prompts will NOT require the key"
+            note "they read ${psrc}, which this stack is not part of,"
+            note "so root stays reachable with the password alone"
+            blank
+            if [[ ${psrc} == other ]]; then
+                note "polkit-1 has no file of its own here, so there is nothing"
+                note "to add the include to -- covering it is not offered"
+            elif ! pam_source_has_anchor polkit-1; then
+                # The include is inserted before '@include common-auth'. Without
+                # that line the sed matches nothing and exits 0, so the script
+                # would report success having changed nothing at all.
+                warn "${psrc} has no '@include common-auth' line to anchor to"
+                note "this script will not edit it; add the include by hand if"
+                note "you want pkexec to require the key"
+            else
+                if [[ ${psrc} == "${PAM_DIR}/polkit-1" ]]; then
+                    note "its file already exists; the include would be added there"
+                else
+                    note "covering them means copying that vendor file to"
+                    note "${PAM_DIR}/polkit-1 and adding the include there"
+                fi
+                if confirm "Cover pkexec too?" y; then
+                    # Either way pam_root_script's vendor branch does the right
+                    # thing: it skips the copy when the file already exists and
+                    # adds the include only when it is missing.
+                    vendor+="polkit-1 "
+                    ok "will add the include to ${PAM_DIR}/polkit-1"
+                fi
+            fi
+            blank
+        fi
+    fi
+
     # --- scope ---
     narrow=""
     while read -r svc; do
         [[ -z ${svc} ]] && continue
         [[ " ${PAM_CORE_SERVICES} " == *" ${svc} "* ]] && continue
+        # polkit-1 is covered on purpose when the user asked for pkexec; do not
+        # then offer to strip it as if it were stray.
+        [[ ${svc} == polkit-1 ]] && continue
         narrow+="${svc} "
     done < <(pam_includers)
     if [[ -n ${narrow} ]]; then
         blank
         info "common-u2f is also included by: ${narrow}"
-        note "there is no /etc/pam.d/polkit-1 on this system, so pkexec and the"
-        note "GUI admin prompts fall back to 'other' -- which is in that list"
-        note "cron and cups, on the other hand, have no business asking for a touch"
+        note "'other' is only consulted for services with no file of their own"
+        note "cron and cups have no business asking for a touch"
         blank
-        if [[ ${newmode} == keyonly ]]; then
-            warn "drop 'other' and pkexec still gives root on the password alone,"
-            warn "so key-only would not actually protect root"
-            blank
-        fi
         if [[ ${newmode} == or ]]; then
             confirm "Limit it to ${PAM_CORE_SERVICES}?" n || narrow=""
         else
@@ -2499,7 +2957,7 @@ step_pam() {
             confirm "Limit it to ${PAM_CORE_SERVICES}?" y || narrow=""
         fi
         if [[ -n ${narrow} && ${newmode} != or ]]; then
-            if confirm "Keep 'other' covered too, so pkexec needs the key?" y; then
+            if confirm "Keep 'other' covered as well?" n; then
                 narrow=${narrow//other /}
                 info "'other' keeps the include"
             fi
@@ -2509,36 +2967,47 @@ step_pam() {
     # --- make sure something will actually read the file ---
     # pamtester uses its own scratch service, so a passing test says nothing
     # about whether sudo and login include this stack at all.
-    local add="" have
-    have=$(pam_includers)
-    if [[ -z ${have} ]]; then
+    # Coverage has to be judged on the state this change will LEAVE BEHIND.
+    # Asking "does anything include it today?" is wrong twice over: narrowing
+    # can strip the only includers, and a machine where sudo has it but
+    # gdm-password does not looks covered while half of what you asked for is
+    # still password-only.
+    local add="" covered="" uncovered="" svc
+    covered=$(pam_core_covered)
+    uncovered=$(pam_core_uncovered)
+
+    if [[ -n ${uncovered} ]]; then
         blank
-        warn "no service on this machine includes common-u2f"
-        note "the file would be written and nothing would read it: sudo and login"
-        note "would still take the password alone, however the tests go"
+        warn "these do not include common-u2f yet: ${uncovered}"
+        [[ -n ${covered} ]] && note "already covered: ${covered}"
+        note "a service that does not include it keeps taking the password alone,"
+        note "however the tests go -- pamtester uses its own scratch service"
         blank
-        info "the include would be added to: ${PAM_CORE_SERVICES}"
-        if confirm "Wire it into those services?" y; then
-            for svc in ${PAM_CORE_SERVICES}; do
-                [[ -f /etc/pam.d/${svc} ]] || { warn "no /etc/pam.d/${svc} -- skipping"; continue; }
-                if ! grep -q '^@include common-auth$' "/etc/pam.d/${svc}" 2>/dev/null; then
-                    warn "/etc/pam.d/${svc} has no 'common-auth' line to anchor to -- skipping"
+        if confirm "Add the include to them?" y; then
+            for svc in ${uncovered}; do
+                if ! pam_has_anchor "${svc}"; then
+                    warn "/etc/pam.d/${svc} has no common-auth line to anchor to -- skipping"
                     continue
                 fi
                 add+="${svc} "
             done
-            [[ -z ${add} ]] && { bad "nothing could be wired up -- not continuing"; pause; return 1; }
-            ok "will add the include to: ${add}"
-        else
-            bad "without an include this would change nothing -- stopping"
-            pause; return 1
+            [[ -n ${add} ]] && ok "will add the include to: ${add}"
         fi
     fi
+
+    if [[ -z ${covered}${add} ]]; then
+        blank
+        bad "after this change nothing would read the configuration"
+        note "sudo and login would still take the password alone -- stopping"
+        pause; return 1
+    fi
+    blank
+    info "after this change the stack will be read by: ${covered}${add}"
 
     # --- prove it, then commit ---
     blank
     pam_stage_and_test "${newmode}" "${opts}" || { pause; return 1; }
-    pam_commit "${newmode}" "${opts}" "${narrow}" "${add}"
+    pam_commit "${newmode}" "${opts}" "${narrow}" "${add}" "${vendor}"
     pause
 }
 
@@ -2560,15 +3029,17 @@ step_guided() {
     local s
 
     section "Guided setup"
-    info "Runs the five setup steps in the order they depend on each other:"
-    note "tools  ->  FIDO2 PIN  ->  signing key  ->  GitHub  ->  askpass"
+    info "Runs the setup steps in the order they depend on each other:"
+    note "tools  ->  FIDO2 PIN  ->  signing key (with GitHub enrolment)  ->  askpass"
     blank
     info "Each one is also on the menu on its own, so you can stop any time."
     blank
     confirm "Start?" y || return 0
 
-    for s in step_install_tools step_fido_init step_create_key \
-             step_github step_askpass; do
+    # step_create_key ends by printing the GitHub enrolment itself, so running
+    # step_github here as well showed the whole thing, and the gh upload
+    # prompt, a second time.
+    for s in step_install_tools step_fido_init step_create_key step_askpass; do
         "${s}" || {
             blank
             warn "that step did not finish cleanly"

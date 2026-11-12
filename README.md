@@ -6,6 +6,23 @@
 Signing key: `sk-ssh-ed25519@openssh.com`, application `ssh:git-signing`,
 resident (stored on the YubiKey), `verify-required` (FIDO2 PIN + touch per signature).
 
+## Checking the script itself
+
+`selftest.sh` is a read-only regression harness for `yubikey-git-signing.sh`. It
+touches nothing on the machine: no `/etc`, no apt, no systemd, no YubiKey. Run it
+after any edit to the script.
+
+```bash
+./selftest.sh ./yubikey-git-signing.sh
+```
+
+It runs the PAM root transaction and its rollback against a sandboxed `/etc/pam.d`,
+drives the signature verification with throwaway GPG keys, and puts the menu through
+a pty. It also calls three small linters beside it — `purity-check.py` (no prompts
+or mutations inside the functions `--check` calls), `lint-locals.py` (no variable
+written before its own `local`) and `lint-reachable.py` (key steps are not
+conditionally nested). Each exists because a specific bug got past review once.
+
 ## 0. Prerequisites
 
 Nothing to install on a normal Ubuntu/Debian desktop. The FIDO2 stack ships with
@@ -84,10 +101,13 @@ restores `/etc/pam.d` after 3 minutes unless you cancel it by running
 `sudo -k && sudo systemctl stop yubikey-pam-rollback.timer` in a new terminal.
 That sudo goes through the new stack, so succeeding at it is the proof.
 
-**key-only does not cover everything.** There is no `/etc/pam.d/polkit-1` on
-Ubuntu, so `pkexec` and the GUI admin prompts fall back to `/etc/pam.d/other`.
-If you narrow the includes and drop `other`, pkexec still grants root on the
-password alone. `sshd` never uses this stack. And `gdm-password` runs
+**key-only does not cover everything.** I got this wrong at first: `pkexec`
+does **not** fall back to `/etc/pam.d/other`. libpam searches `/etc/pam.d` and
+then the vendor directory `/usr/lib/pam.d`, and polkitd ships
+`/usr/lib/pam.d/polkit-1` — so pkexec reads that file whatever you do to
+`other`, and root stays reachable with the password alone. Covering it means
+creating `/etc/pam.d/polkit-1` (a copy of the vendor file plus the include),
+which overrides it; the script offers exactly that in the locking modes. `sshd` never uses this stack. And `gdm-password` runs
 `pam_gnome_keyring`, which unlocks the login keyring from the password you
 type — log in on the key alone and the keyring stays locked, so you get an
 unlock prompt every session.
