@@ -8,7 +8,7 @@ MUTATING_SUB = [
     (r"systemctl", r"^systemctl\s+(--user\s+)?(enable|disable|start|stop|restart|reload|mask|unmask|reset-failed)\b"),
     (r"ykman", r"^ykman\s+.*\b(reset|change-pin|change-puk|change-management-key|generate|import|delete)\b"),
 ]
-REPORTS = ("check_all", "check_gcr", "piv_teleport_report", "piv_slot_report",
+REPORTS = ("check_all", "check_gcr", "auth_report", "ssh_github_uses_key", "piv_teleport_report", "piv_slot_report",
            "pam_report", "pcsc_holders", "pkcs11_bridges", "fido_pin_state")
 
 def strip_strings(line):

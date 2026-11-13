@@ -12,7 +12,7 @@
 # Deliberately NOT using `set -e`: a grep with no match must not kill the UI.
 set -uo pipefail
 
-VERSION="1.14.0"
+VERSION="1.15.0"
 
 # ----------------------------------------------------------------------------
 # Paths. Keys live in ~/.config/git/keys, never in ~/.ssh -- see check_gcr().
@@ -25,6 +25,20 @@ ALLOWED_SIGNERS="${HOME}/.config/git/allowed_signers"
 ENV_DIR="${HOME}/.config/environment.d"
 ENV_FILE="${ENV_DIR}/10-ssh-askpass.conf"
 SK_APPLICATION="ssh:git-signing"
+
+# The SSH authentication key for GitHub: a second resident credential with its
+# own application string.  Reusing ssh:git-signing would overwrite the signing
+# key on the YubiKey, and a bare "ssh:" could clobber a default key the user
+# already keeps there.
+AUTH_KEY_NAME="id_ed25519_sk_github"
+AUTH_PRIV="${KEY_DIR}/${AUTH_KEY_NAME}"
+AUTH_PUB="${AUTH_PRIV}.pub"
+AUTH_APPLICATION="ssh:github-auth"
+SSH_DIR="${HOME}/.ssh"
+SSH_CONFIG="${SSH_DIR}/config"
+KNOWN_HOSTS="${SSH_DIR}/known_hosts"
+SSH_BLOCK_BEGIN="# >>> yubikey-git-signing: github.com >>>"
+SSH_BLOCK_END="# <<< yubikey-git-signing: github.com <<<"
 
 MIN_SSH_MAJOR=8
 MIN_SSH_MINOR=4
@@ -527,6 +541,35 @@ fido_pin_state() {
     printf 'set -'
 }
 
+# A resident credential needs a usable FIDO2 PIN.  Says why not, and returns 1,
+# when ssh-keygen would only fail; without ykman it cannot tell, and lets it try.
+fido_pin_ready() {
+    local state retries
+    detect_ykman || return 0
+    read -r state retries <<<"$(fido_pin_state)"
+    case ${state} in
+        unset)
+            bad "no FIDO2 PIN is set"
+            note "run 'Set the FIDO2 PIN' from the menu first"
+            note "a resident credential cannot be created without a PIN"
+            return 1 ;;
+        tempblocked)
+            bad "the FIDO2 PIN is temporarily blocked -- ssh-keygen would fail"
+            note "unplug the YubiKey and put it back in, then try again"
+            return 1 ;;
+        mustchange)
+            bad "the FIDO2 PIN must be changed before it can be used"
+            note "run 'Set the FIDO2 PIN' from the menu, or: ykman fido access change-pin"
+            return 1 ;;
+        blocked)
+            bad "the FIDO2 PIN is blocked -- every attempt has been used"
+            note "only a FIDO2 reset clears this, and it wipes every credential"
+            return 1 ;;
+    esac
+    [[ ${retries} != "-" ]] && info "FIDO2 PIN: ${retries} attempts remaining"
+    return 0
+}
+
 # Application string embedded in an sk public key, e.g. ssh:git-signing
 pub_application() {
     cut -d' ' -f2 "$1" 2>/dev/null | base64 -d 2>/dev/null \
@@ -838,6 +881,14 @@ check_all() {
         (( WARN_COUNT++ ))
     fi
 
+    # --- GitHub SSH key, only once there is one ---
+    if [[ -f ${AUTH_PRIV} ]]; then
+        blank
+        printf '  %s%s%s\n' "${BOLD}" "GitHub SSH authentication" "${RESET}"
+        blank
+        auth_report
+    fi
+
     # --- sudo/login, only when something is configured (info only) ---
     if [[ -f ${PAM_U2F_FILE} ]]; then
         blank
@@ -877,6 +928,11 @@ check_gcr() {
         # Deliberately NOT GCR_FAILED: that flag offers 'ssh-add -d' plus an
         # agent restart, which does nothing about a file sitting on disk.
         (( FAIL_COUNT++ ))
+    fi
+    if [[ -f "${HOME}/.ssh/${AUTH_KEY_NAME}" ]]; then
+        warn "a copy of the GitHub SSH key is in ~/.ssh -- gcr-ssh-agent will offer it to every host"
+        note "  mv ~/.ssh/${AUTH_KEY_NAME}* ${KEY_DIR}/"
+        (( WARN_COUNT++ ))
     fi
     [[ -f ${KEY_PUB} ]] || { info "agent interception check skipped (no key yet)"; return 0; }
 
@@ -1534,37 +1590,13 @@ post_install_checks() {
 # 3. Create the git signing credential
 # ----------------------------------------------------------------------------
 step_create_key() {
-    local email state retries app policy
+    local email app policy
     local -a sk_opts=()
 
     section "Create a FIDO2 credential for git signing"
 
     require_device || { pause; return 1; }
-
-    if detect_ykman; then
-        read -r state retries <<<"$(fido_pin_state)"
-        if [[ ${state} == unset ]]; then
-            bad "no FIDO2 PIN is set"
-            note "run 'Set the FIDO2 PIN' from the menu first"
-            note "a resident credential cannot be created without a PIN"
-            pause; return 1
-        fi
-        case ${state} in
-            tempblocked)
-                bad "the FIDO2 PIN is temporarily blocked -- ssh-keygen would fail"
-                note "unplug the YubiKey and put it back in, then try again"
-                pause; return 1 ;;
-            mustchange)
-                bad "the FIDO2 PIN must be changed before it can be used"
-                note "run 'Set the FIDO2 PIN' from the menu, or: ykman fido access change-pin"
-                pause; return 1 ;;
-            blocked)
-                bad "the FIDO2 PIN is blocked -- every attempt has been used"
-                note "only a FIDO2 reset clears this, and it wipes every credential"
-                pause; return 1 ;;
-        esac
-        [[ ${retries} != "-" ]] && info "FIDO2 PIN: ${retries} attempts remaining"
-    fi
+    fido_pin_ready || { pause; return 1; }
 
     # Never clobber a working credential.
     if [[ -f ${KEY_PRIV} ]]; then
@@ -1756,7 +1788,7 @@ step_github_instructions() {
     blank
     printf '%s%s%s\n' "${MUTED}" "$(cat "${KEY_PUB}")" "${RESET}"
     blank
-    note "the same key may also be added separately as an Authentication Key"
+    note "for git push and pull over SSH, use 'SSH key for GitHub' -- a separate key"
     if [[ -n ${email} ]]; then
         note "for the Verified badge, ${email} must be a verified email on the account"
     fi
@@ -1768,12 +1800,10 @@ step_github_instructions() {
         info "no clipboard tool available (install wl-clipboard or xclip)"
     fi
 
-    # gh is an outward-facing action: always ask.
-    if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+    # gh is an outward-facing action: gh_add_key always asks.
+    if command -v gh >/dev/null 2>&1 && gh auth status -h github.com >/dev/null 2>&1; then
         blank
-        if confirm "Upload it to GitHub now with gh?" n; then
-            run_interactive gh ssh-key add "${KEY_PUB}" --type signing --title "YubiKey git signing"
-        fi
+        gh_add_key "${KEY_PUB}" signing "YubiKey git signing"
     fi
     # Explicit: without this the function returns whatever the last command
     # said, so declining the upload, or a failed gh, would read as the no-key
@@ -1785,6 +1815,474 @@ step_github_instructions() {
 # where it has already paused. Any other outcome -- including a failed
 # 'gh ssh-key add' -- must still pause, or the menu redraw wipes the error.
 step_github() { step_github_instructions || return 0; pause; }
+
+# ----------------------------------------------------------------------------
+# GitHub CLI
+# ----------------------------------------------------------------------------
+# Scopes on the logged-in gh token, one per line.  Empty when gh does not list
+# any: not logged in, or a fine-grained token, which has no scope list.
+gh_token_scopes() {
+    gh auth status -h github.com 2>&1 \
+        | sed -n "s/.*Token scopes: //p" | head -1 \
+        | tr ',' '\n' | tr -d " '"
+}
+
+# Can the token add keys of this kind?  $1 is the admin: scope; the write:
+# one is enough too.  With no scope list to read, let GitHub be the judge.
+gh_can_add() {
+    local scopes
+    scopes=$(gh_token_scopes)
+    [[ -z ${scopes} ]] && return 0
+    grep -qxF -e "$1" -e "write:${1#admin:}" <<<"${scopes}"
+}
+
+# Put a public key on the GitHub account.  $1 the .pub, $2 authentication or
+# signing, $3 its title.  Outward-facing, so it always asks first.  0 when the
+# key is on GitHub afterwards, uploaded now or already there.
+#
+# gh's default login carries neither scope: 'gh ssh-key add' needs
+# admin:public_key for authentication keys and admin:ssh_signing_key for
+# signing keys, and without them GitHub refuses the upload.
+gh_add_key() {
+    local pub=$1 type=$2 title=$3 scope endpoint blob a
+    case ${type} in
+        authentication) scope=admin:public_key;      endpoint=user/keys;            a=an ;;
+        signing)        scope=admin:ssh_signing_key; endpoint=user/ssh_signing_keys; a=a ;;
+        *)              return 1 ;;
+    esac
+    command -v gh >/dev/null 2>&1 || { info "gh is not installed"; return 1; }
+    if ! gh auth status -h github.com >/dev/null 2>&1; then
+        info "gh is not logged in (gh auth login)"
+        return 1
+    fi
+
+    # An empty blob would match every key on the account as "already there".
+    blob=$(pub_blob "${pub}"); blob=${blob#* }
+    [[ -n ${blob} ]] || { bad "no public key in ${pub}"; return 1; }
+
+    # Listing works with gh's default login on most accounts; when it does not,
+    # the upload below finds out.
+    if gh api "${endpoint}" --paginate --jq '.[].key' 2>/dev/null | grep -qF -- "${blob}"; then
+        ok "already on GitHub as ${a} ${type} key"
+        return 0
+    fi
+    confirm "Add it to your GitHub account as ${a} ${type} key now?" n || return 1
+
+    # Only now, once the user wants the upload, ask for the scope it needs.
+    if ! gh_can_add "${scope}"; then
+        warn "your gh login cannot add ${type} keys: it lacks the ${scope} scope"
+        note "granting it opens GitHub in the browser, where you approve the permission"
+        confirm "Grant gh the ${scope} scope now?" y || return 1
+        run_interactive gh auth refresh -h github.com -s "${scope}" || return 1
+    fi
+    run_interactive gh ssh-key add "${pub}" --type "${type}" --title "${title}"
+}
+
+# ----------------------------------------------------------------------------
+# SSH to github.com with the authentication key
+# ----------------------------------------------------------------------------
+# The managed block.  It goes FIRST in ~/.ssh/config: ssh keeps the first value
+# it finds for most options, so IdentitiesOnly and IdentityAgent here win over
+# anything later in the file.  IdentityAgent none keeps gcr-ssh-agent out of
+# it -- the agent cannot drive a FIDO2 token.  The closing 'Host *' hands the
+# rest of the file back to every host, so top-level options already there do
+# not end up under 'Host github.com'.
+ssh_github_block() {
+    printf '%s\n' "${SSH_BLOCK_BEGIN}" \
+        "Host github.com" \
+        "    IdentityFile \"${AUTH_PRIV}\"" \
+        "    IdentitiesOnly yes" \
+        "    IdentityAgent none" \
+        "Host *" \
+        "${SSH_BLOCK_END}"
+}
+
+# How many managed blocks $1 holds: 0 or 1.  Fails on anything else -- an
+# unclosed or doubled marker -- because stripping between broken markers could
+# eat the user's own config.
+ssh_block_count() {
+    [[ -f $1 ]] || { printf 0; return 0; }
+    awk -v b="${SSH_BLOCK_BEGIN}" -v e="${SSH_BLOCK_END}" '
+        $0 == b { if (open) bad = 1; open = 1; n++ }
+        $0 == e { if (!open) bad = 1; open = 0 }
+        END { if (open || bad || n > 1) exit 1; printf "%d", n }' "$1"
+}
+
+# $1 with the managed block first and any older copy of it removed, on stdout.
+ssh_config_with_block() {
+    ssh_github_block
+    [[ -f $1 ]] || return 0
+    awk -v b="${SSH_BLOCK_BEGIN}" -v e="${SSH_BLOCK_END}" '
+        $0 == b { skip = 1; next }
+        skip && $0 == e { skip = 0; next }
+        !skip' "$1"
+}
+
+# Write the block into $1 (default ~/.ssh/config).  Keeps a copy of the old
+# file, and writes through a symlink -- dotfile managers use them -- instead
+# of replacing it.
+install_ssh_block() {
+    local cfg=${1:-${SSH_CONFIG}} dir tmp
+    if ! ssh_block_count "${cfg}" >/dev/null; then
+        bad "the yubikey-git-signing markers in ${cfg} are damaged"
+        note "fix or remove them by hand; the file was not changed"
+        return 1
+    fi
+    dir=$(dirname "${cfg}")
+    mkdir -p -m 700 "${dir}" || return 1
+    tmp=$(mktemp "${dir}/.config.XXXXXX") || return 1
+    if ! ssh_config_with_block "${cfg}" > "${tmp}"; then
+        rm -f "${tmp}"; return 1
+    fi
+    if [[ -e ${cfg} ]] && ! cp -p -- "${cfg}" "${cfg}.bak-$(date +%Y%m%d-%H%M%S)"; then
+        rm -f "${tmp}"; return 1
+    fi
+    if [[ -L ${cfg} ]]; then
+        cat "${tmp}" > "${cfg}" || { rm -f "${tmp}"; return 1; }
+        rm -f "${tmp}"
+    elif ! { chmod 600 "${tmp}" && mv -- "${tmp}" "${cfg}"; }; then
+        rm -f "${tmp}"; return 1
+    fi
+    return 0
+}
+
+# Would ssh use the authentication key for github.com, with no agent?  ssh -G
+# resolves every Host, Match and Include and connects to nothing.  $1 is a
+# config file for the self-test; normally ssh reads its usual ones.
+ssh_github_uses_key() {
+    local g first
+    local -a f=()
+    [[ -n ${1:-} ]] && f=(-F "$1")
+    g=$(ssh "${f[@]}" -G github.com </dev/null 2>/dev/null) || return 1
+    first=$(sed -n 's/^identityfile //p' <<<"${g}" | head -1)
+    [[ $(expand_tilde "${first}") == "${AUTH_PRIV}" ]] || return 1
+    grep -qx 'identitiesonly yes' <<<"${g}" || return 1
+    grep -qx 'identityagent none' <<<"${g}"
+}
+
+# GitHub's published SSH host keys as known_hosts lines.  Fetched over HTTPS:
+# that is the trust anchor, instead of a yes to an unverified fingerprint on
+# first contact.
+github_host_keys() {
+    local raw=""
+    if command -v gh >/dev/null 2>&1 && gh auth status -h github.com >/dev/null 2>&1; then
+        raw=$(gh api meta --jq '.ssh_keys[]' 2>/dev/null)
+    elif command -v curl >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+        raw=$(curl -fsSL --proto '=https' --max-time 15 https://api.github.com/meta 2>/dev/null \
+            | python3 -I -c 'import json, sys; print("\n".join(json.load(sys.stdin)["ssh_keys"]))' 2>/dev/null)
+    fi
+    sed -n 's|^\([a-z0-9@.-]\{1,\}\) \([A-Za-z0-9+/]\{1,\}=*\)$|github.com \1 \2|p' <<<"${raw}"
+}
+
+# Bring known_hosts $1 in line with the published lines $2.  Prints trusted
+# (every github.com entry is a published key), added, conflict (an entry
+# GitHub does not publish -- left alone) or unavailable.
+github_known_hosts_merge() {
+    local kh=$1 published=$2 have line
+    [[ -n ${published} ]] || { printf 'unavailable'; return 1; }
+    # "type key" for each entry, hashed or not; @cert-authority and @revoked
+    # lines carry one more leading field.
+    have=$(ssh-keygen -F github.com -f "${kh}" 2>/dev/null \
+        | awk '/^#/ { next } $1 ~ /^@/ { print $3 " " $4; next } NF { print $2 " " $3 }')
+    if [[ -n ${have} ]]; then
+        while IFS= read -r line; do
+            if ! grep -qxF -- "github.com ${line}" <<<"${published}"; then
+                printf 'conflict'; return 1
+            fi
+        done <<<"${have}"
+        printf 'trusted'; return 0
+    fi
+    mkdir -p -m 700 "$(dirname "${kh}")" || { printf 'unavailable'; return 1; }
+    printf '%s\n' "${published}" >> "${kh}" || { printf 'unavailable'; return 1; }
+    printf 'added'
+}
+
+AUTH_BACKUP=""
+auth_backup() {
+    AUTH_BACKUP=""
+    [[ -f ${AUTH_PRIV} ]] || return 0
+    AUTH_BACKUP="${AUTH_PRIV}.bak-$(date +%Y%m%d-%H%M%S)"
+    if ! mv -- "${AUTH_PRIV}" "${AUTH_BACKUP}"; then
+        AUTH_BACKUP=""; return 1
+    fi
+    [[ -f ${AUTH_PUB} ]] && mv -- "${AUTH_PUB}" "${AUTH_BACKUP}.pub"
+    info "previous key kept as ${AUTH_BACKUP}"
+    return 0
+}
+
+auth_restore() {
+    [[ -n ${AUTH_BACKUP} && -f ${AUTH_BACKUP} && ! -f ${AUTH_PRIV} ]] || return 0
+    mv -- "${AUTH_BACKUP}" "${AUTH_PRIV}" || return 1
+    [[ -f ${AUTH_BACKUP}.pub ]] && mv -- "${AUTH_BACKUP}.pub" "${AUTH_PUB}"
+    info "previous key restored"
+    return 0
+}
+
+# Create the credential.  $1 is "replace" when the user has already agreed to
+# overwrite the one on the YubiKey; ssh-keygen then asks, and yes is right.
+auth_create() {
+    local mode=${1:-new} email policy
+    local -a sk_opts=()
+
+    require_device || return 1
+    fido_pin_ready || return 1
+    email=$(resolve_email)
+    [[ -z ${email} ]] && { bad "no email given"; return 1; }
+
+    blank
+    ui_menu "Protection for each push and pull" \
+        "Touch only          (each fetch and push needs a touch)" \
+        "FIDO2 PIN + touch   (the PIN as well; GUI clients need an askpass helper)" \
+        || { info "cancelled"; return 1; }
+    if (( MENU_INDEX == 0 )); then policy=touch; else policy=pin+touch; fi
+    mapfile -t sk_opts < <(sk_policy_opts "${policy}")
+    note "background fetches from an IDE (VS Code autofetch) will ask too, or fail quietly"
+
+    mkdir -p -m 700 "${KEY_DIR}"
+    auth_backup || return 1
+
+    blank
+    hint "The YubiKey will ask for the FIDO2 PIN (not the PIV PIN), then a touch."
+    if [[ ${mode} == replace ]]; then
+        hint "If ssh-keygen asks to overwrite the key on the token, answer y."
+    else
+        hint "If ssh-keygen reports that a resident key already exists on the token,"
+        hint "answer n and choose 'Download the one already on this YubiKey' instead."
+    fi
+    blank
+    if ! run_interactive ssh-keygen -t ed25519-sk \
+            -O resident -O application="${AUTH_APPLICATION}" "${sk_opts[@]}" \
+            -C "${email} github ssh" -N "" -f "${AUTH_PRIV}"; then
+        bad "key generation failed"
+        auth_restore
+        return 1
+    fi
+    chmod 600 "${AUTH_PRIV}"; chmod 644 "${AUTH_PUB}"
+    ok "created ${AUTH_PRIV}"
+    ok "each push and pull will need $(sk_policy_needs "${policy}")"
+    if [[ -n ${AUTH_BACKUP} ]]; then
+        note "remove the old key from GitHub: https://github.com/settings/keys"
+    fi
+    return 0
+}
+
+# Fetch the credential made on another machine.  -K writes every resident SSH
+# credential into the current directory, so it runs in a scratch one.
+auth_download() {
+    local tmp pub found=""
+
+    require_device || return 1
+    info "ssh-keygen -K downloads every resident SSH credential on the key;"
+    info "only the one whose application is ${AUTH_APPLICATION} is kept."
+    hint "You will be asked for the FIDO2 PIN (not the PIV PIN), then a touch."
+    blank
+    tmp=$(mktemp -d) || return 1
+    if ! ( cd "${tmp}" && run_interactive ssh-keygen -K -N "" ); then
+        bad "download failed"
+        rm -rf "${tmp}"; return 1
+    fi
+    for pub in "${tmp}"/*.pub; do
+        [[ -f ${pub} ]] || continue
+        [[ $(pub_application "${pub}") == "${AUTH_APPLICATION}" ]] && found=${pub%.pub}
+    done
+    if [[ -z ${found} ]]; then
+        bad "this YubiKey has no resident credential with application ${AUTH_APPLICATION}"
+        note "choose 'Create a new one' instead"
+        rm -rf "${tmp}"; return 1
+    fi
+    mkdir -p -m 700 "${KEY_DIR}"
+    if ! { mv -- "${found}" "${AUTH_PRIV}" && mv -- "${found}.pub" "${AUTH_PUB}"; }; then
+        bad "could not move the key into ${KEY_DIR}"
+        rm -rf "${tmp}"; return 1
+    fi
+    rm -rf "${tmp}"
+    chmod 600 "${AUTH_PRIV}"; chmod 644 "${AUTH_PUB}"
+    ok "installed as ${AUTH_PRIV}"
+    return 0
+}
+
+# ssh -T exits 1 even when it works -- GitHub offers no shell -- so the
+# greeting is what counts.  Shown live through tee: the touch prompt is on
+# stderr, and swallowing it would leave the user waiting for nothing.
+auth_test_connection() {
+    local log
+    log=$(mktemp) || return 1
+    leave_alt
+    TTY_TOUCHED=1; stty sane 2>/dev/null
+    printf '\n  %s%s ssh -T git@github.com%s\n\n' "${MUTED}" "${G_ARROW}" "${RESET}"
+    ssh -T git@github.com 2>&1 | tee "${log}"
+    printf '\n'
+    if grep -q "successfully authenticated" "${log}"; then
+        rm -f "${log}"
+        ok "GitHub accepted the key"
+        return 0
+    fi
+    rm -f "${log}"
+    bad "GitHub did not accept the key"
+    note "a key added a moment ago can take a minute; otherwise see: ssh -vT git@github.com"
+    return 1
+}
+
+# Read-only, for --check.
+auth_report() {
+    local app policy
+    ok "GitHub SSH key present: ${AUTH_PRIV}"
+    if [[ -f ${AUTH_PUB} ]]; then
+        app=$(pub_application "${AUTH_PUB}")
+        if [[ ${app} == "${AUTH_APPLICATION}" ]]; then
+            note "application: ${app}"
+        else
+            rwarn "its application is '${app:-none}', expected ${AUTH_APPLICATION}"
+        fi
+    fi
+    if policy=$(sk_policy "${AUTH_PRIV}"); then
+        note "each push and pull needs $(sk_policy_needs "${policy}")"
+    fi
+    if ssh_github_uses_key; then
+        ok "ssh uses it for github.com, with no agent"
+    else
+        rwarn "ssh does not use it for github.com -- run the menu step again"
+    fi
+    if ssh-keygen -F github.com -f "${KNOWN_HOSTS}" >/dev/null 2>&1; then
+        ok "github.com is in known_hosts"
+    else
+        rwarn "github.com is not in known_hosts yet"
+    fi
+}
+
+# ----------------------------------------------------------------------------
+# 7. SSH authentication key for GitHub
+# ----------------------------------------------------------------------------
+# The order is the point.  The config block switches on IdentitiesOnly and
+# switches off the agent for github.com, so writing it before GitHub knows the
+# key would break SSH pushes that work today: key, then GitHub, then host
+# keys, then the config, then a real connection.
+step_github_auth() {
+    local needs onhub=0
+
+    section "SSH authentication key for GitHub"
+
+    info "A second FIDO2 credential on the same YubiKey, for git push and pull"
+    info "over SSH. The signing key is not touched."
+    note "application ${AUTH_APPLICATION}, saved as ${AUTH_PRIV}"
+    note "only git@github.com: remotes use it -- https:// remotes are unaffected"
+    blank
+
+    if [[ -f ${AUTH_PRIV} ]]; then
+        ok "already have one: ${AUTH_PRIV}"
+        # The .pub can be rebuilt from the handle without the YubiKey; without
+        # it the GitHub check below would have nothing to compare.
+        if [[ ! -s ${AUTH_PUB} ]]; then
+            if ssh-keygen -y -P "" -f "${AUTH_PRIV}" > "${AUTH_PUB}" 2>/dev/null </dev/null \
+                    && [[ -s ${AUTH_PUB} ]]; then
+                chmod 644 "${AUTH_PUB}"
+                info "rebuilt the missing ${AUTH_PUB}"
+            else
+                rm -f "${AUTH_PUB}"
+                bad "${AUTH_PUB} is missing and could not be rebuilt"
+                pause; return 1
+            fi
+        fi
+        ui_menu "What now?" \
+            "Keep it, and finish the setup (GitHub, host keys, ssh config)" \
+            "Replace it with a new one" \
+            || { info "cancelled"; return 1; }
+        if (( MENU_INDEX == 1 )); then
+            warn "a new credential for ${AUTH_APPLICATION} replaces the one on the YubiKey"
+            note "every machine that uses the old one loses SSH access to GitHub"
+            blank
+            if ! confirm_typed "REGENERATE" "This replaces your GitHub SSH key everywhere it is used."; then
+                info "cancelled"; pause; return 1
+            fi
+            auth_create replace || { pause; return 1; }
+        fi
+    else
+        ui_menu "Get the key" \
+            "Create a new one" \
+            "Download the one already on this YubiKey (made on another machine)" \
+            || { info "cancelled"; return 1; }
+        if (( MENU_INDEX == 0 )); then
+            auth_create new || { pause; return 1; }
+        else
+            auth_download || { pause; return 1; }
+        fi
+    fi
+    needs=$(sk_policy_needs "$(sk_policy "${AUTH_PRIV}")")
+
+    # --- GitHub ---
+    blank
+    if gh_add_key "${AUTH_PUB}" authentication "YubiKey SSH"; then
+        onhub=1
+    else
+        blank
+        info "to add it by hand: https://github.com/settings/ssh/new"
+        note "Key type: Authentication Key"
+        blank
+        printf '%s%s%s\n' "${MUTED}" "$(cat "${AUTH_PUB}")" "${RESET}"
+        blank
+        clipboard_copy "${AUTH_PUB}" && ok "public key copied to the clipboard"
+        confirm "Is it on GitHub now?" n && onhub=1
+    fi
+    if (( ! onhub )); then
+        blank
+        info "stopping here: pointing ssh at a key GitHub does not know would break"
+        info "SSH access that works today. Run this step again once the key is added."
+        pause; return 1
+    fi
+
+    # --- host keys ---
+    blank
+    case $(github_known_hosts_merge "${KNOWN_HOSTS}" "$(github_host_keys)") in
+        trusted) ok "known_hosts already has GitHub's published host keys" ;;
+        added)   ok "added GitHub's published host keys to ${KNOWN_HOSTS}" ;;
+        conflict)
+            bad "known_hosts has a github.com key that GitHub does not publish"
+            note "it may be the RSA key GitHub replaced in March 2023 -- or interception"
+            note "check it, then run: ssh-keygen -R github.com, and this step again"
+            pause; return 1 ;;
+        *)
+            warn "could not fetch GitHub's host keys"
+            note "ssh will ask you to confirm the fingerprint on first connection; compare it with"
+            note "https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints" ;;
+    esac
+
+    # --- ssh config ---
+    blank
+    if ssh_github_uses_key; then
+        ok "ssh already uses it for github.com, with no agent"
+    else
+        info "adding this to the top of ${SSH_CONFIG}:"
+        blank
+        ssh_github_block | sed 's/^/      /'
+        blank
+        note "first in the file, so it wins over any later github.com settings;"
+        note "'Host *' keeps the rest of the file applying to every host"
+        note "the current file is kept as ${SSH_CONFIG}.bak-<time>"
+        blank
+        if ! confirm "Write it?" y; then
+            info "skipped -- ssh will not use the key until this is in place"
+            pause; return 1
+        fi
+        install_ssh_block || { pause; return 1; }
+        if ssh_github_uses_key; then
+            ok "ssh now uses it for github.com, with no agent"
+        else
+            bad "written, but ssh still resolves github.com differently"
+            note "something in /etc/ssh/ssh_config may win; compare: ssh -G github.com"
+            pause; return 1
+        fi
+    fi
+
+    # --- a real connection ---
+    blank
+    if confirm "Test the connection to GitHub now? (needs ${needs})" y; then
+        auth_test_connection
+    fi
+    blank
+    info "SSH remotes look like git@github.com:owner/repo.git. To switch one:"
+    note "  git remote set-url origin git@github.com:owner/repo.git"
+    pause
+}
 
 # ----------------------------------------------------------------------------
 # Remediation: un-advertise the key from a running agent
@@ -3139,6 +3637,7 @@ main_menu() {
             "Run the dependency check" \
             "Fix agent interception (gcr caching the key)" \
             "-- Same key, other uses" \
+            "SSH key for GitHub (git push and pull)" \
             "Prepare PIV for Teleport (hardware key support)" \
             "Use the key for sudo and login (PAM)" \
             "--" \
@@ -3154,9 +3653,10 @@ main_menu() {
             6)  step_reimport ;;
             7)  step_check ;;
             8)  step_fix_agent ;;
-            9)  step_piv_teleport ;;
-            10) step_pam ;;
-            11) return 0 ;;
+            9)  step_github_auth ;;
+            10) step_piv_teleport ;;
+            11) step_pam ;;
+            12) return 0 ;;
         esac
     done
 }
@@ -3168,8 +3668,9 @@ yubikey-git-signing.sh ${VERSION}
 Set up a YubiKey for git commit signing over SSH, using the FIDO2 applet:
 no pcscd, no PKCS#11, no ssh-agent.
 
-It can also prepare the PIV applet for Teleport hardware key support, which
-is a separate applet on the same key and does need pcscd.
+It can also create a second FIDO2 key for git push and pull to GitHub over
+SSH, and prepare the PIV applet for Teleport hardware key support, which is a
+separate applet on the same key and does need pcscd.
 
   (no arguments)   interactive menu
   --check          read-only dependency and configuration report
