@@ -8,7 +8,7 @@ and your sudo/login factor — without the usual GNOME agent pitfalls.**
 ![Bash](https://img.shields.io/badge/bash-5%2B-4EAA25?logo=gnubash&logoColor=white)
 ![Ubuntu](https://img.shields.io/badge/Ubuntu%20%2F%20Debian-E95420?logo=ubuntu&logoColor=white)
 ![YubiKey](https://img.shields.io/badge/YubiKey-5%20series-84BD00?logo=yubico&logoColor=white)
-![Self-test](https://img.shields.io/badge/self--test-141%20checks-blue)
+![Self-test](https://img.shields.io/badge/self--test-170%20checks-blue)
 
 </div>
 
@@ -20,6 +20,7 @@ and your sudo/login factor — without the usual GNOME agent pitfalls.**
 - [What it sets up](#-what-it-sets-up)
 - [Requirements](#-requirements)
 - [The menu](#-the-menu)
+- [SSH key for GitHub](#-ssh-key-for-github)
 - [sudo and login (PAM)](#-sudo-and-login-pam)
 - [Teleport (PIV)](#-teleport-piv)
 - [Doing it by hand](#-doing-it-by-hand)
@@ -56,6 +57,7 @@ One YubiKey has separate applets for separate jobs. They don't interfere with ea
 | Use | Applet | Transport | Needs pcscd |
 |---|---|---|:---:|
 | **Git commit & tag signing** | FIDO2 | USB HID | ❌ |
+| **Git push & pull to GitHub** (SSH) | FIDO2 | USB HID | ❌ |
 | **sudo & login** (`pam_u2f`) | FIDO2 | USB HID | ❌ |
 | **Teleport hardware key** | PIV | CCID / PC/SC | ✅ |
 
@@ -131,6 +133,7 @@ Check and repair
    Fix agent interception (gcr caching the key)
 
 Same key, other uses
+   SSH key for GitHub (git push and pull)
    Prepare PIV for Teleport (hardware key support)
    Use the key for sudo and login (PAM)
 ```
@@ -154,6 +157,57 @@ Yubico publishes **no `.deb`**. The script offers three options:
 The GUI is a management tool only. Git signing doesn't use it.
 
 </details>
+
+---
+
+## 🔗 SSH key for GitHub
+
+**SSH key for GitHub** creates a second FIDO2 credential on the same YubiKey for
+`git push` and `git pull` over SSH. It's separate from the signing key: application
+`ssh:github-auth`, file `~/.config/git/keys/id_ed25519_sk_github`. Making it can't
+touch `ssh:git-signing`.
+
+The step works in an order that never breaks SSH access you already have:
+
+1. **Get the key.** Create a new one (touch only, or PIN + touch), or download the
+   one already on the YubiKey from another machine.
+2. **Put it on GitHub** as an *Authentication* key with `gh`, after asking. If `gh`
+   isn't set up, it shows the key and the page to paste it into, and goes no further
+   until you confirm it's added.
+3. **Trust GitHub's host keys** by fetching the ones GitHub publishes over HTTPS,
+   instead of answering *yes* to an unverified fingerprint on first connection.
+   An existing `github.com` entry that GitHub doesn't publish is reported and
+   left alone.
+4. **Point ssh at it** with a block at the top of `~/.ssh/config`, after showing it
+   and asking:
+   ```text
+   # >>> yubikey-git-signing: github.com >>>
+   Host github.com
+       IdentityFile "~/.config/git/keys/id_ed25519_sk_github"
+       IdentitiesOnly yes
+       IdentityAgent none
+   Host *
+   # <<< yubikey-git-signing: github.com <<<
+   ```
+   It goes first because ssh keeps the first value it finds, so these lines win over
+   any later `github.com` settings. `IdentityAgent none` keeps gcr-ssh-agent out,
+   since it can't drive a FIDO2 token. The closing `Host *` keeps the rest of your
+   file applying to every host. The old file is backed up, and the result is
+   checked with `ssh -G github.com`. (The script writes your real home path where
+   this shows `~`.)
+5. **Test it** with `ssh -T git@github.com`.
+
+> [!NOTE]
+> Only `git@github.com:` remotes use SSH. HTTPS remotes keep working as before. To
+> switch a repository: `git remote set-url origin git@github.com:owner/repo.git`.
+> Every fetch and push now needs a touch, and that includes background fetches from
+> IDEs such as VS Code's autofetch.
+
+> [!TIP]
+> `gh`'s default login can't add SSH keys. Adding an authentication key needs the
+> `admin:public_key` scope, and a signing key needs `admin:ssh_signing_key`. When
+> one is missing, the script offers `gh auth refresh -h github.com -s <scope>`,
+> which you approve in the browser.
 
 ---
 
@@ -306,7 +360,8 @@ That's PIN + touch. Drop `-O verify-required` for touch only.
 A new key has a new fingerprint, so update `allowed_signers` and your forge.
 
 **Forge.** Upload the `.pub` as a **Signing key**, not an Authentication key. They're
-separate entries, and you can add the same key as both. GitHub and GitLab both verify
+separate entries. For push and pull over SSH, use the separate key from
+[SSH key for GitHub](#-ssh-key-for-github) instead. GitHub and GitLab both verify
 `sk-ssh-ed25519@openssh.com` signatures. Azure DevOps doesn't show SSH signature status.
 
 </details>

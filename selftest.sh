@@ -77,7 +77,8 @@ cat >> "${WORK}/menu.sh" <<'EOF'
 OPTS=("Guided setup" "-- Set up" "Install tools" "Set the PIN" "Create the key"
       "Enrol on GitHub" "Install askpass" "-- Already have a key" "Reimport"
       "-- Check and repair" "Dependency check" "Fix agent interception"
-      "-- Same key, other uses" "PIV for Teleport" "sudo and login" "--" "Quit")
+      "-- Same key, other uses" "SSH key for GitHub" "PIV for Teleport" "sudo and login"
+      "--" "Quit")
 SEL=(); for o in "${OPTS[@]}"; do [[ $o == --* ]] || SEL+=("$o"); done
 term_height(){ printf '%s' "${ROWS:-40}"; }
 ui_menu "t" "${OPTS[@]}" > "${OUT:-/dev/null}"
@@ -88,7 +89,7 @@ nav() { printf '%b' "$1" | timeout 20 script -qec "ROWS=${2:-40} OUT=${3:-/dev/n
 
 [[ $(nav '\n') == "IDX=0 LABEL=Guided setup" ]] && ok "Enter selects the first item" || no "Enter selects the first item" "$(nav '\n')"
 [[ $(nav 'jj\n') == "IDX=2 LABEL=Set the PIN" ]] && ok "j steps over headings" || no "j steps over headings" "$(nav 'jj\n')"
-[[ $(nav 'k\n') == "IDX=11 LABEL=Quit" ]] && ok "k from the top wraps to the end" || no "k wraps" "$(nav 'k\n')"
+[[ $(nav 'k\n') == "IDX=12 LABEL=Quit" ]] && ok "k from the top wraps to the end" || no "k wraps" "$(nav 'k\n')"
 [[ -z $(nav '\033[1;5A') ]] && ok "Ctrl+Up selects nothing" || no "Ctrl+Up selects nothing" "$(nav '\033[1;5A')"
 [[ -z $(nav '\033[15~') ]]  && ok "F5 selects nothing"      || no "F5 selects nothing" "$(nav '\033[15~')"
 [[ $(nav '\033[B\n') == "IDX=1 LABEL=Install tools" ]] && ok "Down arrow still works" || no "Down arrow still works"
@@ -488,6 +489,130 @@ done
 grep -qiF "PIN only" <<<"${CK}" && no "create still offers PIN only" || ok "create does not offer PIN only"
 grep -qF '"${sk_opts[@]}"' <<<"${CK}" \
     && ok "ssh-keygen gets the policy options as a quoted array" || no "policy options not passed as an array"
+
+# ---------------------------------------------------- GitHub SSH key
+group "GitHub SSH authentication key"
+# Its own credential: sharing the application string would overwrite the
+# signing key on the YubiKey.
+SKA=$(sed -n 's/^SK_APPLICATION="\(.*\)"$/\1/p' "${SCRIPT}")
+AUA=$(sed -n 's/^AUTH_APPLICATION="\(.*\)"$/\1/p' "${SCRIPT}")
+[[ -n ${AUA} && ${AUA} != "${SKA}" && ${AUA} == ssh:?* ]] \
+    && ok "auth key has its own application (${AUA}, not ${SKA})" \
+    || no "auth application collides or is malformed" "${AUA} vs ${SKA}"
+[[ $(sed -n 's/^AUTH_KEY_NAME="\(.*\)"$/\1/p' "${SCRIPT}") != "$(sed -n 's/^KEY_NAME="\(.*\)"$/\1/p' "${SCRIPT}")" ]] \
+    && ok "auth key has its own file name" || no "auth key file name collides with the signing key"
+
+# The ~/.ssh/config writer, in a sandbox. Every case is checked through
+# 'ssh -F <file> -G', which is what ssh itself would resolve.
+stub "${WORK}/sshcfg.sh" expand_tilde ssh_github_block ssh_block_count \
+    ssh_config_with_block install_ssh_block ssh_github_uses_key
+SC="${WORK}/sshc"; mkdir -p "${SC}"
+cat >> "${WORK}/sshcfg.sh" <<EOF
+HOME='${SC}/home'
+AUTH_PRIV='${SC}/home/.config/git/keys/id_ed25519_sk_github'
+SSH_BLOCK_BEGIN='$(sed -n 's/^SSH_BLOCK_BEGIN="\(.*\)"$/\1/p' "${SCRIPT}")'
+SSH_BLOCK_END='$(sed -n 's/^SSH_BLOCK_END="\(.*\)"$/\1/p' "${SCRIPT}")'
+EOF
+cfgdo() { bash -c "source '${WORK}/sshcfg.sh'; $1" 2>/dev/null; }
+CF="${SC}/home/.ssh/config"
+
+cfgdo "install_ssh_block '${CF}'" && ok "writes a config that did not exist" || no "fresh config write failed"
+[[ $(stat -c '%a' "${CF}" 2>/dev/null) == 600 && $(stat -c '%a' "${SC}/home/.ssh" 2>/dev/null) == 700 ]] \
+    && ok "new ~/.ssh is 700 and config is 600" \
+    || no "modes" "$(stat -c '%a %n' "${SC}/home/.ssh" "${CF}" 2>&1 | tr '\n' ' ')"
+cfgdo "ssh_github_uses_key '${CF}'" && ok "ssh -G: github.com uses the key, no agent" || no "ssh -G does not resolve to the key"
+
+# an existing file: a top-level option, a catch-all and another github.com block
+rm -f "${CF}" "${CF}".bak-*
+printf 'ServerAliveInterval 42\nHost github.com\n    IdentityFile ~/.ssh/old\n    User git\nHost *\n    IdentitiesOnly no\n' > "${CF}"
+cp "${CF}" "${SC}/orig"
+cfgdo "install_ssh_block '${CF}'"; cfgdo "install_ssh_block '${CF}'"
+[[ $(grep -cxF "Host github.com" "${CF}") -eq 2 && $(grep -c '>>> yubikey-git-signing' "${CF}") -eq 1 ]] \
+    && ok "running twice leaves one managed block" || no "managed block duplicated" "$(cat "${CF}")"
+[[ $(head -1 "${CF}") == "# >>> yubikey-git-signing: github.com >>>" ]] \
+    && ok "the block is at the top of the file" || no "block not first"
+diff <(sed '1,/<<< yubikey-git-signing/d' "${CF}") "${SC}/orig" >/dev/null \
+    && ok "the rest of the file is kept byte for byte" || no "existing config changed" "$(diff <(sed '1,/<<< yubikey-git-signing/d' "${CF}") "${SC}/orig")"
+ls "${CF}".bak-* >/dev/null 2>&1 && ok "the previous file is backed up" || no "no backup taken"
+cfgdo "ssh_github_uses_key '${CF}'" && ok "ssh -G: the block wins over a later github.com block" \
+    || no "a later block wins" "$(ssh -F "${CF}" -G github.com </dev/null 2>/dev/null | grep -E '^(identityfile|identitiesonly|identityagent) ' | tr '\n' ' ')"
+G=$(ssh -F "${CF}" -G example.com </dev/null 2>/dev/null)
+grep -qx 'serveraliveinterval 42' <<<"${G}" && ! grep -qx 'identityagent none' <<<"${G}" \
+    && ok "ssh -G: other hosts keep their settings and their agent" || no "the block leaked to other hosts"
+
+# broken markers: refuse, and leave the file exactly as it was
+printf '# >>> yubikey-git-signing: github.com >>>\nHost github.com\nServerAliveInterval 9\n' > "${CF}"
+cp "${CF}" "${SC}/broken"
+cfgdo "install_ssh_block '${CF}'" && no "damaged markers were written over" || ok "damaged markers: refuses to write"
+cmp -s "${CF}" "${SC}/broken" && ok "damaged markers: the file is untouched" || no "damaged file was modified"
+
+# a symlinked config (dotfile managers) stays a symlink
+rm -f "${CF}" "${CF}".bak-*; printf 'Host *\n    ServerAliveInterval 7\n' > "${SC}/dotfile"
+ln -s "${SC}/dotfile" "${CF}"
+cfgdo "install_ssh_block '${CF}'"
+[[ -L ${CF} ]] && grep -q 'IdentityAgent none' "${SC}/dotfile" \
+    && ok "a symlinked config is written through, not replaced" || no "symlink replaced or target not written"
+
+# known_hosts merge, against made-up "published" keys
+stub "${WORK}/kh.sh" github_known_hosts_merge
+KH="${WORK}/kh"; mkdir -p "${KH}"
+ssh-keygen -q -t ed25519 -N '' -f "${KH}/a" -C '' >/dev/null 2>&1
+ssh-keygen -q -t ed25519 -N '' -f "${KH}/b" -C '' >/dev/null 2>&1
+PUB="github.com $(cut -d' ' -f1,2 "${KH}/a.pub")"
+# inside bash -c the published lines arrive as $1 ($0 is the "_")
+khm() { bash -c "source '${WORK}/kh.sh'; github_known_hosts_merge '$1' \"\$1\"" _ "$2" 2>/dev/null; }
+[[ $(khm "${KH}/known_hosts" "${PUB}") == added ]] && grep -qxF "${PUB}" "${KH}/known_hosts" \
+    && ok "known_hosts: published keys are added" || no "known_hosts not added"
+[[ $(khm "${KH}/known_hosts" "${PUB}") == trusted && $(grep -c . "${KH}/known_hosts") -eq 1 ]] \
+    && ok "known_hosts: a second run adds nothing" || no "known_hosts duplicated"
+printf 'github.com %s\n' "$(cut -d' ' -f1,2 "${KH}/b.pub")" > "${KH}/kh2"; cp "${KH}/kh2" "${KH}/kh2.orig"
+[[ $(khm "${KH}/kh2" "${PUB}") == conflict ]] && cmp -s "${KH}/kh2" "${KH}/kh2.orig" \
+    && ok "known_hosts: an unpublished github.com key is refused and left alone" || no "conflict not detected"
+printf '%s\n' "${PUB}" > "${KH}/kh3"; ssh-keygen -q -H -f "${KH}/kh3" >/dev/null 2>&1; rm -f "${KH}/kh3.old"
+[[ $(khm "${KH}/kh3" "${PUB}") == trusted ]] \
+    && ok "known_hosts: a hashed entry of a published key counts" || no "hashed entry not recognised" "$(khm "${KH}/kh3" "${PUB}")"
+[[ $(khm "${KH}/kh4" "") == unavailable && ! -e ${KH}/kh4 ]] \
+    && ok "known_hosts: nothing fetched, nothing written" || no "wrote known_hosts with nothing fetched"
+
+# gh scope detection, with a fake gh that only answers 'auth status'
+stub "${WORK}/scope.sh" gh_token_scopes gh_can_add
+GB="${WORK}/ghbin"; mkdir -p "${GB}"
+printf '#!/usr/bin/env bash\nprintf "%%b" "${FAKE_STATUS}" >&2\n' > "${GB}/gh"; chmod +x "${GB}/gh"
+can() { FAKE_STATUS=$1 PATH="${GB}:${PATH}" bash -c "source '${WORK}/scope.sh'; gh_can_add '$2'"; }
+ST="  - Token scopes: 'gist', 'read:org', 'repo', 'workflow'\n"
+can "${ST}" admin:public_key && no "missing scope reported as present" || ok "gh scopes: a default login cannot add keys"
+can "  - Token scopes: 'repo', 'admin:public_key'\n" admin:public_key \
+    && ok "gh scopes: admin:public_key is enough" || no "admin:public_key not seen"
+can "  - Token scopes: 'repo', 'write:public_key'\n" admin:public_key \
+    && ok "gh scopes: write:public_key is enough" || no "write:public_key not seen"
+can "  - Token scopes: 'admin:public_key'\n" admin:ssh_signing_key \
+    && no "an auth-key scope was taken for the signing scope" || ok "gh scopes: the signing scope is separate"
+can "  ✓ Logged in to github.com (GH_TOKEN)\n" admin:public_key \
+    && ok "gh scopes: no scope list (fine-grained token) lets GitHub decide" || no "no scope list blocked the upload"
+
+# gh_add_key: an empty key must never read as "already on GitHub" -- grep -F
+# with an empty pattern matches every line -- and the scope is only asked for
+# once the user has said yes to the upload.
+GA=$(sed -n '/^gh_add_key() {/,/^}/p' "${SCRIPT}")
+grep -qF '[[ -n ${blob} ]] || ' <<<"${GA}" \
+    && ok "gh_add_key refuses an empty public key" || no "an empty key could match every GitHub key"
+q=$(grep -n -m1 -F 'confirm "Add it' <<<"${GA}" | cut -d: -f1)
+r=$(grep -n -m1 -F 'gh auth refresh' <<<"${GA}" | cut -d: -f1)
+[[ -n $q && -n $r ]] && (( q < r )) \
+    && ok "the scope is requested only after the user agrees to upload" || no "scope asked before the upload question" "$q $r"
+grep -qF 'ssh-keygen -y -P ""' <<<"$(sed -n '/^step_github_auth() {/,/^}/p' "${SCRIPT}")" \
+    && ok "a missing auth .pub is rebuilt from the handle" || no "a missing auth .pub is not handled"
+
+# The order is what keeps SSH access working: GitHub must know the key
+# before ssh is told to use only it.
+SA=$(sed -n '/^step_github_auth() {/,/^}/p' "${SCRIPT}")
+ln_of() { grep -n -m1 -F -- "$1" <<<"${SA}" | cut -d: -f1; }
+a=$(ln_of 'gh_add_key'); g=$(ln_of '(( ! onhub ))'); k=$(ln_of 'github_known_hosts_merge')
+c=$(ln_of 'install_ssh_block'); t=$(ln_of 'auth_test_connection')
+[[ -n $a && -n $g && -n $k && -n $c && -n $t ]] && (( a < g && g < k && k < c && c < t )) \
+    && ok "step order: GitHub, gate, host keys, ssh config, test" || no "step order" "$a $g $k $c $t"
+grep -qF 'successfully authenticated' <<<"$(sed -n '/^auth_test_connection() {/,/^}/p' "${SCRIPT}")" \
+    && ok "the connection test reads the greeting, not ssh's exit code" || no "connection test checks the wrong thing"
 
 # ------------------------------------------------ signature verification
 group "Tarball signature verification"
