@@ -12,7 +12,7 @@
 # Deliberately NOT using `set -e`: a grep with no match must not kill the UI.
 set -uo pipefail
 
-VERSION="1.13.1"
+VERSION="1.14.0"
 
 # ----------------------------------------------------------------------------
 # Paths. Keys live in ~/.config/git/keys, never in ~/.ssh -- see check_gcr().
@@ -535,6 +535,60 @@ pub_application() {
 
 pub_blob() { cut -d' ' -f1,2 "$1" 2>/dev/null; }
 
+# Signing policy of an sk private key, read from its flags byte: 0x01 is user
+# presence (touch), 0x04 user verification (PIN).  The handle is unencrypted
+# (-N ""), so ssh-keygen loads it without the YubiKey; -P "" makes a
+# passphrase-protected file fail instead of prompting.  ssh-keygen only logs
+# the flags at debug level, hence -v and the stderr scrape.
+# Prints pin+touch, pin, touch or none.
+sk_policy() {
+    local hex flags
+    hex=$(ssh-keygen -v -y -P "" -f "$1" 2>&1 >/dev/null </dev/null \
+        | sed -n 's/.*sk_flags 0x\([0-9a-fA-F][0-9a-fA-F]*\).*/\1/p' | head -1)
+    [[ -n ${hex} ]] || return 1
+    flags=$(( 16#${hex} ))
+    if (( flags & 4 )); then
+        if (( flags & 1 )); then printf 'pin+touch'; else printf 'pin'; fi
+    elif (( flags & 1 )); then
+        printf 'touch'
+    else
+        printf 'none'
+    fi
+}
+
+sk_policy_label() {
+    case $1 in
+        pin+touch) printf 'FIDO2 PIN + touch' ;;
+        pin)       printf 'FIDO2 PIN only (no touch)' ;;
+        touch)     printf 'touch only (no PIN)' ;;
+        none)      printf 'no PIN and no touch' ;;
+        *)         printf 'unknown' ;;
+    esac
+}
+
+# What each signature asks of you, for prompts.
+sk_policy_needs() {
+    case $1 in
+        pin+touch) printf 'the FIDO2 PIN and a touch' ;;
+        pin)       printf 'the FIDO2 PIN' ;;
+        touch)     printf 'a touch' ;;
+        none)      printf 'nothing' ;;
+        *)         printf 'the FIDO2 PIN and/or a touch' ;;
+    esac
+}
+
+# ssh-keygen -O options for each policy the create step offers, one per line.
+# No PIN-only choice: without the touch, anything that has seen the PIN can
+# sign, GitHub's verifier rejects the signatures, and ssh-keygen -K brings the
+# key back touch-required anyway.
+sk_policy_opts() {
+    case $1 in
+        pin+touch) printf '%s\n' -O verify-required ;;
+        touch)     ;;
+        *)         return 1 ;;
+    esac
+}
+
 askpass_binary() {
     local p
     for p in /usr/bin/ssh-askpass /usr/lib/openssh/gnome-ssh-askpass \
@@ -564,7 +618,7 @@ need_root_check() {
 # 5. Dependency check (read-only)
 # ----------------------------------------------------------------------------
 check_all() {
-    local v major minor helper devs ndev state retries val blob app
+    local v major minor helper devs ndev state retries val blob app policy
     local lddout
 
     FAIL_COUNT=0; WARN_COUNT=0
@@ -753,6 +807,15 @@ check_all() {
             app=$(pub_application "${KEY_PUB}")
             [[ -n ${app} ]] && note "application: ${app}"
             note "$(ssh-keygen -lf "${KEY_PUB}" 2>/dev/null)"
+        fi
+        if policy=$(sk_policy "${KEY_PRIV}"); then
+            case ${policy} in
+                none)
+                    warn "signing policy: $(sk_policy_label none) -- anything on this machine can sign"
+                    (( WARN_COUNT++ )) ;;
+                *)
+                    ok "signing policy: $(sk_policy_label "${policy}")" ;;
+            esac
         fi
     else
         info "no key at ${KEY_PRIV} yet"
@@ -1460,7 +1523,9 @@ post_install_checks() {
         fi
     fi
     blank
-    if confirm "Run a real test commit now? (needs the FIDO2 PIN and a touch)" y; then
+    local needs
+    needs=$(sk_policy_needs "$(sk_policy "${KEY_PRIV}")")
+    if confirm "Run a real test commit now? (needs ${needs})" y; then
         run_test_commit
     fi
 }
@@ -1469,7 +1534,8 @@ post_install_checks() {
 # 3. Create the git signing credential
 # ----------------------------------------------------------------------------
 step_create_key() {
-    local email state retries verify_opt app
+    local email state retries app policy
+    local -a sk_opts=()
 
     section "Create a FIDO2 credential for git signing"
 
@@ -1523,7 +1589,8 @@ step_create_key() {
         "FIDO2 PIN + touch   (recommended; GUI clients need an askpass helper)" \
         "Touch only          (simpler for IDE commits, no PIN per signature)" \
         || { info "cancelled"; return 1; }
-    if (( MENU_INDEX == 0 )); then verify_opt="-O verify-required"; else verify_opt=""; fi
+    if (( MENU_INDEX == 0 )); then policy=pin+touch; else policy=touch; fi
+    mapfile -t sk_opts < <(sk_policy_opts "${policy}")
 
     mkdir -p -m 700 "${KEY_DIR}"
     backup_existing_key
@@ -1533,9 +1600,8 @@ step_create_key() {
     hint "If ssh-keygen reports that a resident key already exists on the token,"
     hint "answer n and use Reimport -- answering y replaces that credential."
     blank
-    # shellcheck disable=SC2086
     if ! run_interactive ssh-keygen -t ed25519-sk \
-            -O resident -O application="${SK_APPLICATION}" ${verify_opt} \
+            -O resident -O application="${SK_APPLICATION}" "${sk_opts[@]}" \
             -C "${email} git signing" -N "" -f "${KEY_PRIV}"; then
         bad "key generation failed"
         note "firmware older than 5.2.3 does not support ed25519-sk -- try -t ecdsa-sk"
@@ -1545,6 +1611,7 @@ step_create_key() {
 
     backup_commit
     chmod 700 "${KEY_DIR}"; chmod 600 "${KEY_PRIV}"; chmod 644 "${KEY_PUB}"
+    ok "each signature will need $(sk_policy_needs "${policy}")"
     configure_git "${email}"
     update_allowed_signers "${KEY_PUB}" "${email}"
     post_install_checks
@@ -1557,7 +1624,7 @@ step_create_key() {
 # 6. Reimport an existing resident credential
 # ----------------------------------------------------------------------------
 step_reimport() {
-    local tmp email found pub priv app base
+    local tmp email found pub priv app base new_policy
 
     section "Reimport an existing FIDO2 git signing key"
 
@@ -1611,6 +1678,8 @@ step_reimport() {
     rm -rf "${tmp}"
     chmod 700 "${KEY_DIR}"; chmod 600 "${KEY_PRIV}"; chmod 644 "${KEY_PUB}"
     ok "installed as ${KEY_PRIV}"
+    new_policy=$(sk_policy "${KEY_PRIV}") \
+        && info "each signature will need $(sk_policy_needs "${new_policy}")"
 
     configure_git "${email}"
     update_allowed_signers "${KEY_PUB}" "${email}"
@@ -3019,7 +3088,9 @@ step_check() {
         confirm "Fix the agent interception now?" y && fix_agent_core
     fi
     blank
-    confirm "Run a real signing test? (needs the FIDO2 PIN and a touch)" n \
+    local needs
+    needs=$(sk_policy_needs "$(sk_policy "${KEY_PRIV}")")
+    confirm "Run a real signing test? (needs ${needs})" n \
         && run_test_commit
     pause
 }

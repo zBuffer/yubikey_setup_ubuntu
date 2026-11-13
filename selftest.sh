@@ -443,6 +443,52 @@ bash "${WORK}/as.sh" "${AS}/key.pub" new@example.test >/dev/null 2>&1
     && ok "allowed_signers: re-running with a new email replaces the line" \
     || no "allowed_signers kept a stale line"
 
+# ------------------------------------------------------- signing policy
+group "Signing policy"
+# sk_policy reads the flags byte from ssh-keygen's debug output. A fake
+# ssh-keygen stands in so no key or YubiKey is needed; it also records its
+# arguments, so a call that could prompt for a passphrase is caught.
+stub "${WORK}/pol.sh" sk_policy sk_policy_label sk_policy_needs sk_policy_opts
+FK="${WORK}/fakebin"; mkdir -p "${FK}"
+cat > "${FK}/ssh-keygen" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "${FAKE_ARGS}"
+[[ -n ${FAKE_FLAGS:-} ]] && printf 'debug1: sk_application: "ssh:git-signing", sk_flags 0x%s\n' "${FAKE_FLAGS}" >&2
+printf 'sk-ssh-ed25519@openssh.com AAAA\n'
+EOF
+chmod +x "${FK}/ssh-keygen"
+pol() { FAKE_FLAGS=$1 FAKE_ARGS="${WORK}/fkargs" PATH="${FK}:${PATH}" \
+        bash -c "source '${WORK}/pol.sh'; sk_policy /dev/null"; }
+[[ $(pol 25) == pin+touch ]] && ok "0x25 (resident, PIN, touch) reads as pin+touch" || no "0x25" "$(pol 25)"
+[[ $(pol 24) == pin ]]       && ok "0x24 reads as pin (no touch)"                  || no "0x24" "$(pol 24)"
+[[ $(pol 21) == touch ]]     && ok "0x21 reads as touch only"                       || no "0x21" "$(pol 21)"
+[[ $(pol 20) == none ]]      && ok "0x20 reads as none"                             || no "0x20" "$(pol 20)"
+[[ $(pol 05) == pin+touch ]] && ok "non-resident 0x05 reads as pin+touch"           || no "0x05" "$(pol 05)"
+pol "" >/dev/null && no "no flags line still returned a policy" || ok "no flags line: sk_policy fails"
+pol 25 >/dev/null
+grep -qx -- '-P' "${WORK}/fkargs" && [[ $(grep -A1 -x -- '-P' "${WORK}/fkargs" | tail -1) == "" ]] \
+    && ok "sk_policy passes -P \"\" so a passphrase-protected file fails instead of prompting" \
+    || no "sk_policy could prompt for a passphrase" "$(tr '\n' ' ' < "${WORK}/fkargs")"
+
+opts() { bash -c "source '${WORK}/pol.sh'; sk_policy_opts '$1' | tr '\n' ' '"; }
+[[ $(opts pin+touch) == "-O verify-required " ]] \
+    && ok "pin+touch creates with -O verify-required" || no "pin+touch opts" "$(opts pin+touch)"
+bash -c "source '${WORK}/pol.sh'; sk_policy_opts pin" >/dev/null \
+    && no "PIN-only can still be created" || ok "PIN-only is not a creatable policy"
+[[ -z $(opts touch) ]] && ok "touch creates with no extra options" || no "touch opts" "$(opts touch)"
+bash -c "source '${WORK}/pol.sh'; sk_policy_opts bogus" >/dev/null \
+    && no "an unknown policy produced options" || ok "an unknown policy is rejected"
+
+# the create step offers exactly PIN + touch and touch only, and passes the
+# options as an array (an empty one for touch)
+CK=$(sed -n '/^step_create_key() {/,/^}/p' "${SCRIPT}")
+for o in "FIDO2 PIN + touch" "Touch only"; do
+    grep -qF "\"${o}" <<<"${CK}" && ok "create offers: ${o}" || no "create does not offer: ${o}"
+done
+grep -qiF "PIN only" <<<"${CK}" && no "create still offers PIN only" || ok "create does not offer PIN only"
+grep -qF '"${sk_opts[@]}"' <<<"${CK}" \
+    && ok "ssh-keygen gets the policy options as a quoted array" || no "policy options not passed as an array"
+
 # ------------------------------------------------ signature verification
 group "Tarball signature verification"
 # ya_verify decides whether a download is trustworthy. Exercised here with
