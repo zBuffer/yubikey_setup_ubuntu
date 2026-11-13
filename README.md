@@ -8,7 +8,7 @@ and your sudo/login factor — without the usual GNOME agent pitfalls.**
 ![Bash](https://img.shields.io/badge/bash-5%2B-4EAA25?logo=gnubash&logoColor=white)
 ![Ubuntu](https://img.shields.io/badge/Ubuntu%20%2F%20Debian-E95420?logo=ubuntu&logoColor=white)
 ![YubiKey](https://img.shields.io/badge/YubiKey-5%20series-84BD00?logo=yubico&logoColor=white)
-![Self-test](https://img.shields.io/badge/self--test-126%20checks-blue)
+![Self-test](https://img.shields.io/badge/self--test-141%20checks-blue)
 
 </div>
 
@@ -61,8 +61,20 @@ One YubiKey has separate applets for separate jobs. They don't interfere with ea
 
 **The signing key** is `sk-ssh-ed25519@openssh.com`. It is *resident*, so it's stored
 on the YubiKey and can be recovered on any machine. Its application string is
-`ssh:git-signing`, and it is created with `verify-required`, so every signature needs
-the FIDO2 PIN **and** a touch. The private scalar never leaves the token.
+`ssh:git-signing`. The private scalar never leaves the token.
+
+When you create the key, you choose what each signature asks for:
+
+| Policy | Each signature needs | `ssh-keygen` options | Notes |
+|---|---|---|---|
+| **PIN + touch** *(recommended)* | FIDO2 PIN and a touch | `-O verify-required` | GUI git clients need an askpass helper |
+| **Touch only** | A touch | *(none)* | Easiest from IDEs |
+
+`--check` reports which policy the installed key uses.
+
+There's deliberately no PIN-only choice. The touch is the one step malware can't
+do for you, GitHub's verifier rejects signatures made without it, and
+`ssh-keygen -K` brings a reimported key back touch-required anyway.
 
 > [!IMPORTANT]
 > Keys are written to `~/.config/git/keys/`, **never `~/.ssh/`**. On GNOME,
@@ -288,6 +300,8 @@ ssh-keygen -t ed25519-sk -O resident -O application=ssh:git-signing \
   -O verify-required -C "$(git config user.email) git signing" \
   -f ~/.config/git/keys/id_ed25519_sk_git
 ```
+
+That's PIN + touch. Drop `-O verify-required` for touch only.
 
 A new key has a new fingerprint, so update `allowed_signers` and your forge.
 
